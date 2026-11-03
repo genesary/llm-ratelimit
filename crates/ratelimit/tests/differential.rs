@@ -5784,7 +5784,10 @@ descriptors:
         ),
         ("POST", "/json/", user.to_string()),
     ];
-    let reset = regex::Regex::new(r#""durationUntilReset":"(\d+)s""#).unwrap();
+    let reset =
+        regex::Regex::new(r#"("durationUntilReset":"|"key":"RateLimit-Reset","value":")(\d+)"#)
+            .unwrap();
+    clear_of_a_minute_boundary().await;
     for (method, target, body) in cases {
         let upstream = send(services[0].http.clone(), method, target, body.clone()).await;
         let ours = send(services[1].http.clone(), method, target, body.clone()).await;
@@ -5795,7 +5798,7 @@ descriptors:
         let resets = |text: &str| -> Vec<i64> {
             reset
                 .captures_iter(text)
-                .map(|c| c[1].parse().unwrap())
+                .map(|c| c[2].parse().unwrap())
                 .collect()
         };
         let (expected, actual) = (resets(&upstream.2), resets(&ours.2));
@@ -5805,21 +5808,10 @@ descriptors:
         }
         let mut times = expected.iter();
         ours.2 = reset
-            .replace_all(&ours.2, |_: &regex::Captures| {
-                format!("\"durationUntilReset\":\"{}s\"", times.next().unwrap())
+            .replace_all(&ours.2, |c: &regex::Captures| {
+                format!("{}{}", &c[1], times.next().unwrap())
             })
             .into_owned();
-        // The same for the `RateLimit-Reset` header.
-        let header_reset = |headers: &[String]| -> Option<(usize, i64)> {
-            headers.iter().enumerate().find_map(|(i, h)| {
-                let seconds = h.strip_prefix("ratelimit-reset: ")?;
-                Some((i, seconds.parse().unwrap()))
-            })
-        };
-        if let (Some((_, e)), Some((i, a))) = (header_reset(&upstream.1), header_reset(&ours.1)) {
-            assert!((e - a).abs() <= 1, "{e} {a}");
-            ours.1[i] = format!("ratelimit-reset: {e}");
-        }
         assert_eq!(ours, upstream, "{method} {target} {body}");
     }
     // A client limit with an unknown unit makes upstream panic, which closes the connection
@@ -14781,13 +14773,13 @@ async fn quota_lookups_read_memcached() {
     clock.0.store(1_000_000_000, Ordering::SeqCst);
     let alice = || request("d", &[&[("user", "alice")]]);
     service.should_rate_limit(&alice()).await.unwrap();
-    // The increment goes after the answer.
-    let weekly = "{d_user_alice_}_fx604800o345600_999475200_weekly";
+    // The increments go after the answer, each counted once memcached has answered it: a key
+    // it shows may not be counted yet.
     for _ in 0..100 {
-        if memcached
-            .ask(&format!("get {weekly}\r\n"))
-            .await
-            .starts_with("VALUE")
+        if stats
+            .snapshot()
+            .get("ratelimit.memcache.add.__code=success")
+            == Some(&2)
         {
             break;
         }
