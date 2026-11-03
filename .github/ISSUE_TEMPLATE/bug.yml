@@ -5,13 +5,13 @@ body:
   - type: markdown
     attributes:
       value: |
-        Security vulnerabilities go through [private reporting](https://github.com/AyRickk/ratelimit/security/advisories/new), not here.
+        Security vulnerabilities go through [private reporting](https://github.com/genesary/ratelimit/security/advisories/new), not here.
   - type: input
     id: version
     attributes:
       label: Version
       description: The image tag or digest, or the commit you built.
-      placeholder: ghcr.io/ayrickk/ratelimit:0.1.0
+      placeholder: ghcr.io/genesary/ratelimit:0.1.0
     validations:
       required: true
   - type: dropdown

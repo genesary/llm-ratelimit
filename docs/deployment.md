@@ -14,7 +14,7 @@ Every variable named here is in [`environment.md`](environment.md); the YAML for
 ## The image
 
 ```text
-ghcr.io/ayrickk/ratelimit:<version>
+ghcr.io/genesary/ratelimit:<version>
 ```
 
 | | |
@@ -31,7 +31,7 @@ ghcr.io/ayrickk/ratelimit:<version>
 Without a shell, files are read from outside the container. To read the licenses:
 
 ```sh
-id=$(docker create ghcr.io/ayrickk/ratelimit:0.1.0)
+id=$(docker create ghcr.io/genesary/ratelimit:0.1.0)
 docker cp "$id:/usr/share/doc/ratelimit" ./ratelimit-licenses
 docker rm "$id"
 ```
@@ -41,8 +41,8 @@ docker rm "$id"
 Each release is signed with cosign (keyless, by the release workflow's GitHub identity), and carries an SBOM and a provenance attestation:
 
 ```sh
-cosign verify ghcr.io/ayrickk/ratelimit:0.1.0 \
-  --certificate-identity https://github.com/AyRickk/ratelimit/.github/workflows/release.yml@refs/tags/v0.1.0 \
+cosign verify ghcr.io/genesary/ratelimit:0.1.0 \
+  --certificate-identity https://github.com/genesary/ratelimit/.github/workflows/release.yml@refs/tags/v0.1.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
@@ -118,7 +118,7 @@ services:
     command: ["redis-server", "--save", ""]
 
   ratelimit:
-    image: ghcr.io/ayrickk/ratelimit:0.1.0
+    image: ghcr.io/genesary/ratelimit:0.1.0
     depends_on: [redis]
     user: "65534:65534"
     read_only: true
@@ -193,7 +193,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: ratelimit
-          image: ghcr.io/ayrickk/ratelimit:0.1.0
+          image: ghcr.io/genesary/ratelimit:0.1.0
           env:
             - {name: RUNTIME_SUBDIRECTORY, value: ratelimit}
             - {name: RUNTIME_WATCH_ROOT, value: "false"}
@@ -268,7 +268,7 @@ The chart values of that test:
 global:
   images:
     ratelimit:
-      image: ghcr.io/ayrickk/ratelimit:0.1.0
+      image: ghcr.io/genesary/ratelimit:0.1.0
       pullPolicy: IfNotPresent
 config:
   envoyGateway:
@@ -299,7 +299,7 @@ kubectl -n envoy-gateway-system rollout restart deployment/envoy-gateway
 
 ## Replacing upstream's image
 
-Change only the image, from `envoyproxy/ratelimit:<tag>` to `ghcr.io/ayrickk/ratelimit:<version>`, and keep the variables, the YAML files, the mounts and the probes:
+Change only the image, from `envoyproxy/ratelimit:<tag>` to `ghcr.io/genesary/ratelimit:<version>`, and keep the variables, the YAML files, the mounts and the probes:
 
 - **Counters:** Redis and Memcached keys are the same, so the windows in progress carry over.
 - **Metrics and logs:** stat names, Prometheus series and log lines are the same, except for the differences in [`parity.md`](parity.md) §7. One of them: no `ratelimit.go.*` stats, and no `go_*` or `process_*` Prometheus metrics.

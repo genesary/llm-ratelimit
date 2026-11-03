@@ -158,7 +158,7 @@ services:
     command: ["redis-server", "--save", ""]
 
   ratelimit:
-    image: ghcr.io/ayrickk/ratelimit:0.1.0
+    image: ghcr.io/genesary/ratelimit:0.1.0
     depends_on: [redis]
     environment:
       RUNTIME_SUBDIRECTORY: ratelimit

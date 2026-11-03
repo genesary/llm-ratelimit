@@ -1,4 +1,4 @@
-module github.com/AyRickk/ratelimit/tools/oracle
+module github.com/genesary/ratelimit/tools/oracle
 
 go 1.27.2
 

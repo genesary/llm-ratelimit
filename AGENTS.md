@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues are tracked in GitHub Issues for AyRickk/ratelimit (via `gh`). See `docs/agents/issue-tracker.md`.
+Issues are tracked in GitHub Issues for genesary/ratelimit (via `gh`). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

@@ -1,9 +1,9 @@
 # ratelimit
 
-[![CI](https://github.com/AyRickk/ratelimit/actions/workflows/ci.yml/badge.svg)](https://github.com/AyRickk/ratelimit/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/AyRickk/ratelimit?sort=semver)](https://github.com/AyRickk/ratelimit/releases)
+[![CI](https://github.com/genesary/ratelimit/actions/workflows/ci.yml/badge.svg)](https://github.com/genesary/ratelimit/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/genesary/ratelimit?sort=semver)](https://github.com/genesary/ratelimit/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/AyRickk/ratelimit/badge)](https://scorecard.dev/viewer/?uri=github.com/AyRickk/ratelimit)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/genesary/ratelimit/badge)](https://scorecard.dev/viewer/?uri=github.com/genesary/ratelimit)
 [![MSRV](https://img.shields.io/badge/rust-1.99-orange)](#building-and-testing)
 
 A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit), compatible with it at commit [`f4e7669`](https://github.com/envoyproxy/ratelimit/commit/f4e7669), and extended with several windows per descriptor for LLM quotas.
@@ -48,7 +48,7 @@ docker run -d --name ratelimit --network rl -p 8080:8080 -p 8081:8081 \
   -v "$PWD/runtime:/srv/runtime_data/current:ro" \
   -e RUNTIME_SUBDIRECTORY=ratelimit -e RUNTIME_WATCH_ROOT=false -e USE_STATSD=false \
   -e REDIS_SOCKET_TYPE=tcp -e REDIS_URL=redis:6379 \
-  ghcr.io/ayrickk/ratelimit:0.1.0
+  ghcr.io/genesary/ratelimit:0.1.0
 ```
 
 gRPC (`envoy.service.ratelimit.v3.RateLimitService`) listens on 8081, and HTTP on 8080. A decision counting 1200 tokens:
@@ -74,7 +74,7 @@ curl -s localhost:8080/quota -d '{"domain":"llm","descriptors":[{"entries":[{"ke
 
 ## Migrating from envoyproxy/ratelimit
 
-Swap the image for `ghcr.io/ayrickk/ratelimit` and keep your configuration and environment variables. The binary is at `/bin/ratelimit`, as upstream's is. Upstream configurations load and count exactly as before. The extensions are opt-in, through `rate_limits:` lists.
+Swap the image for `ghcr.io/genesary/ratelimit` and keep your configuration and environment variables. The binary is at `/bin/ratelimit`, as upstream's is. Upstream configurations load and count exactly as before. The extensions are opt-in, through `rate_limits:` lists.
 
 ## Features
 
@@ -105,11 +105,11 @@ The full documentation is in [`docs/`](docs/README.md):
 
 ## Releases and verification
 
-Images are published as `ghcr.io/ayrickk/ratelimit:<version>` for linux/amd64 and linux/arm64, with an SBOM and provenance, signed with cosign (keyless):
+Images are published as `ghcr.io/genesary/ratelimit:<version>` for linux/amd64 and linux/arm64, with an SBOM and provenance, signed with cosign (keyless):
 
 ```sh
-cosign verify ghcr.io/ayrickk/ratelimit:0.1.0 \
-  --certificate-identity https://github.com/AyRickk/ratelimit/.github/workflows/release.yml@refs/tags/v0.1.0 \
+cosign verify ghcr.io/genesary/ratelimit:0.1.0 \
+  --certificate-identity https://github.com/genesary/ratelimit/.github/workflows/release.yml@refs/tags/v0.1.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
