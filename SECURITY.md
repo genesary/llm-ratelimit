@@ -12,7 +12,7 @@ Only the latest release gets security fixes. Before 1.0, that is the latest `0.x
 
 Do not open a public issue. Report it privately, in one of two ways:
 
-- **GitHub's private vulnerability reporting** (preferred): [open a draft advisory](https://github.com/AyRickk/ratelimit/security/advisories/new).
+- **GitHub's private vulnerability reporting** (preferred): [open a draft advisory](https://github.com/genesary/ratelimit/security/advisories/new).
 - **Email:** [dev@ayrick.fr](mailto:dev@ayrick.fr).
 
 Include the version or image digest, the configuration and environment needed to reproduce, and the impact you see.
