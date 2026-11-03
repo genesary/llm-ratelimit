@@ -6597,11 +6597,7 @@ async fn a_busy_debug_port_is_ignored_like_upstream() {
 async fn server_calls(service: &Service, redis: &Redis) {
     use ratelimit_proto::grpc::health::v1::{HealthCheckRequest, HealthListRequest};
     resp_command(&redis.address, &["FLUSHALL"]).await;
-    clear_of_a_window_boundary(
-        std::time::Duration::from_secs(60),
-        std::time::Duration::from_secs(2),
-    )
-    .await;
+    clear_of_a_minute_boundary().await;
     let mut client = service.client().await;
     for _ in 0..3 {
         client
@@ -7814,8 +7810,8 @@ async fn a_per_second_redis_starts_like_upstream() {
 }
 
 /// The stderr of `binary` run with `environment`, serving gRPC and HTTP on `ports`: once it
-/// serves, each request in turn (errors ignored), then `json` on `/json` (answered with 200),
-/// then `linger`, then SIGTERM.
+/// serves, each request in turn (errors ignored) clear of a minute boundary, then `json` on
+/// `/json` (answered with 200), then `linger`, then SIGTERM.
 async fn requested_run(
     binary: &std::path::Path,
     environment: &[(&str, String)],
@@ -7841,12 +7837,7 @@ async fn requested_run(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let mut client = client.expect("the service serves");
-    // The requests' counters of a minute (`LLM_CONFIG`'s) in one window.
-    clear_of_a_window_boundary(
-        std::time::Duration::from_secs(60),
-        std::time::Duration::from_secs(2),
-    )
-    .await;
+    clear_of_a_minute_boundary().await;
     for request in requests {
         let _ = client.should_rate_limit(request.clone()).await;
     }
@@ -10785,8 +10776,9 @@ impl RedisCluster {
     }
 }
 
-/// Waits for the next `window` (a minute, an hour) when less than `margin` is left of this one:
-/// a test whose counters of that window must stay in one window, on both binaries.
+/// Waits for the next `window` (whole seconds: a minute, an hour) when less than `margin` is
+/// left of this one: a test whose counters of that window must stay in one window, on both
+/// binaries.
 async fn clear_of_a_window_boundary(window: std::time::Duration, margin: std::time::Duration) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -10796,6 +10788,16 @@ async fn clear_of_a_window_boundary(window: std::time::Duration, margin: std::ti
     if left < margin {
         tokio::time::sleep(left + std::time::Duration::from_millis(5)).await;
     }
+}
+
+/// Waits for the next minute when less than 2 s is left of this one: requests whose hits on
+/// `LLM_CONFIG`'s limit (2 a minute) must be counted in one window, on both binaries.
+async fn clear_of_a_minute_boundary() {
+    clear_of_a_window_boundary(
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(2),
+    )
+    .await;
 }
 
 /// Waits for the start of the next second of the system's clock.
