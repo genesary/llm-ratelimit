@@ -10689,32 +10689,36 @@ impl RedisCluster {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         }
-        // Every slot range lists its replica (the topology radix and fred read).
+        // Every node's slot ranges list their replica (the topology radix and fred read): the
+        // nodes learn of the replicas seconds apart, and radix closes a replica's pool when its
+        // refresh asks a node that hides it.
         if replicas {
-            for attempt in 0.. {
-                let slots: Value = nodes[0]
-                    .client
-                    .custom(
-                        CustomCommand::new_static("CLUSTER", ClusterHash::Random, false),
-                        vec!["SLOTS"],
-                    )
-                    .await
-                    .unwrap();
-                let listed = match &slots {
-                    Value::Array(sets) => sets
-                        .iter()
-                        .all(|set| matches!(set, Value::Array(set) if set.len() >= 4)),
-                    _ => false,
-                };
-                if listed {
-                    break;
+            for node in &nodes {
+                for attempt in 0.. {
+                    let slots: Value = node
+                        .client
+                        .custom(
+                            CustomCommand::new_static("CLUSTER", ClusterHash::Random, false),
+                            vec!["SLOTS"],
+                        )
+                        .await
+                        .unwrap();
+                    let listed = match &slots {
+                        Value::Array(sets) => sets
+                            .iter()
+                            .all(|set| matches!(set, Value::Array(set) if set.len() >= 4)),
+                        _ => false,
+                    };
+                    if listed {
+                        break;
+                    }
+                    // Up to 30 s: slow under the full suite's load.
+                    assert!(
+                        attempt < 1500,
+                        "the replicas are not in the topology: {slots:?}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
-                // Up to 30 s: slow under the full suite's load.
-                assert!(
-                    attempt < 1500,
-                    "the replicas are not in the topology: {slots:?}"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             // And each replica is in sync.
             for replica in &nodes[3..] {
