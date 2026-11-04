@@ -277,7 +277,7 @@ With `BACKEND_TYPE=memcache`:
 
 **A decision is not atomic.** It reads the counters with one `get` of all its keys, answers from them, then increments each key in the background (`incr`, or `add` for a new key). Requests arriving at the same instant can each see the old counter, so a client can briefly exceed its limit. Refunds are `decr`, which memcached floors at 0, also after the answer.
 
-**Failures do not fail the decision.** A read that fails, a key memcached cannot take (over 250 bytes, or with spaces or control characters), or a value that is not a number is logged, and the request is answered from what was read: an unread counter counts as 0. Keep descriptor values short and free of spaces; a `rate_limits:` key, with its hash tag, shape and name, is longer than a `rate_limit:` one.
+**Failures do not fail the decision.** A read that fails, a key memcached cannot take (over 250 bytes, or with spaces or control characters), or a value that is not a number is logged, and the request is answered from what was read: an unread counter counts as 0. Keep descriptor values short and free of spaces; a `rate_limits:` key, with its hash tag, shape and name, is longer than a `rate_limit:` one. A warning at load names a `rate_limits:` limit whose key takes over 186 bytes before its window's start and the request's values.
 
 **What Memcached cannot count.** `anchored` windows need a script that reads and writes atomically. A configuration with one is refused at load on Memcached: `only fixed windows can be counted on Memcached`. `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` has no effect on Memcached.
 
