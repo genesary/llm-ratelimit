@@ -5784,7 +5784,10 @@ descriptors:
         ),
         ("POST", "/json/", user.to_string()),
     ];
-    let reset = regex::Regex::new(r#""durationUntilReset":"(\d+)s""#).unwrap();
+    let reset =
+        regex::Regex::new(r#"("durationUntilReset":"|"key":"RateLimit-Reset","value":")(\d+)"#)
+            .unwrap();
+    clear_of_a_minute_boundary().await;
     for (method, target, body) in cases {
         let upstream = send(services[0].http.clone(), method, target, body.clone()).await;
         let ours = send(services[1].http.clone(), method, target, body.clone()).await;
@@ -5795,7 +5798,7 @@ descriptors:
         let resets = |text: &str| -> Vec<i64> {
             reset
                 .captures_iter(text)
-                .map(|c| c[1].parse().unwrap())
+                .map(|c| c[2].parse().unwrap())
                 .collect()
         };
         let (expected, actual) = (resets(&upstream.2), resets(&ours.2));
@@ -5805,21 +5808,10 @@ descriptors:
         }
         let mut times = expected.iter();
         ours.2 = reset
-            .replace_all(&ours.2, |_: &regex::Captures| {
-                format!("\"durationUntilReset\":\"{}s\"", times.next().unwrap())
+            .replace_all(&ours.2, |c: &regex::Captures| {
+                format!("{}{}", &c[1], times.next().unwrap())
             })
             .into_owned();
-        // The same for the `RateLimit-Reset` header.
-        let header_reset = |headers: &[String]| -> Option<(usize, i64)> {
-            headers.iter().enumerate().find_map(|(i, h)| {
-                let seconds = h.strip_prefix("ratelimit-reset: ")?;
-                Some((i, seconds.parse().unwrap()))
-            })
-        };
-        if let (Some((_, e)), Some((i, a))) = (header_reset(&upstream.1), header_reset(&ours.1)) {
-            assert!((e - a).abs() <= 1, "{e} {a}");
-            ours.1[i] = format!("ratelimit-reset: {e}");
-        }
         assert_eq!(ours, upstream, "{method} {target} {body}");
     }
     // A client limit with an unknown unit makes upstream panic, which closes the connection
@@ -6592,9 +6584,12 @@ async fn a_busy_debug_port_is_ignored_like_upstream() {
 
 /// The calls whose server stats are compared: `ShouldRateLimit`, health `Check` (one for a
 /// service it does not know) and `List`, which upstream's interceptor counts, and a `Watch`,
-/// which it does not (streams are not intercepted).
-async fn server_calls(service: &Service) {
+/// which it does not (streams are not intercepted). The rate limit's hits start from an empty
+/// `redis`, in one minute (`LLM_CONFIG`'s window), so that each run counts the same.
+async fn server_calls(service: &Service, redis: &Redis) {
     use ratelimit_proto::grpc::health::v1::{HealthCheckRequest, HealthListRequest};
+    resp_command(&redis.address, &["FLUSHALL"]).await;
+    clear_of_a_minute_boundary().await;
     let mut client = service.client().await;
     for _ in 0..3 {
         client
@@ -6695,7 +6690,7 @@ async fn server_stats_are_reported_like_upstream() {
             tagged.clone(),
         ];
         let service = Service::start(binary, &stats_environment(redis, sink)).await;
-        server_calls(&service).await;
+        server_calls(&service, redis).await;
         sums.push(wait_for_server_stats(|| server.lines.lock().unwrap().clone()).await);
     }
     assert!(
@@ -6729,7 +6724,7 @@ async fn server_stats_are_reported_like_upstream() {
             tagged.clone(),
         ];
         let service = Service::start(binary, &stats_environment(redis, sink)).await;
-        server_calls(&service).await;
+        server_calls(&service, redis).await;
         let lines = || {
             let datagrams = server.datagrams.lock().unwrap();
             datagrams
@@ -6773,7 +6768,7 @@ async fn server_stats_are_reported_like_upstream() {
             ];
             sink.extend(tags.clone());
             let service = Service::start(binary, &stats_environment(redis, sink)).await;
-            server_calls(&service).await;
+            server_calls(&service, redis).await;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let mut previous: Option<Vec<String>> = None;
             let lines = loop {
@@ -7807,8 +7802,8 @@ async fn a_per_second_redis_starts_like_upstream() {
 }
 
 /// The stderr of `binary` run with `environment`, serving gRPC and HTTP on `ports`: once it
-/// serves, each request in turn (errors ignored), then `json` on `/json` (answered with 200),
-/// then `linger`, then SIGTERM.
+/// serves, each request in turn (errors ignored) clear of a minute boundary, then `json` on
+/// `/json` (answered with 200), then `linger`, then SIGTERM.
 async fn requested_run(
     binary: &std::path::Path,
     environment: &[(&str, String)],
@@ -7834,6 +7829,7 @@ async fn requested_run(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let mut client = client.expect("the service serves");
+    clear_of_a_minute_boundary().await;
     for request in requests {
         let _ = client.should_rate_limit(request.clone()).await;
     }
@@ -10685,32 +10681,36 @@ impl RedisCluster {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         }
-        // Every slot range lists its replica (the topology radix and fred read).
+        // Every node's slot ranges list their replica (the topology radix and fred read): the
+        // nodes learn of the replicas seconds apart, and radix closes a replica's pool when its
+        // refresh asks a node that hides it.
         if replicas {
-            for attempt in 0.. {
-                let slots: Value = nodes[0]
-                    .client
-                    .custom(
-                        CustomCommand::new_static("CLUSTER", ClusterHash::Random, false),
-                        vec!["SLOTS"],
-                    )
-                    .await
-                    .unwrap();
-                let listed = match &slots {
-                    Value::Array(sets) => sets
-                        .iter()
-                        .all(|set| matches!(set, Value::Array(set) if set.len() >= 4)),
-                    _ => false,
-                };
-                if listed {
-                    break;
+            for node in &nodes {
+                for attempt in 0.. {
+                    let slots: Value = node
+                        .client
+                        .custom(
+                            CustomCommand::new_static("CLUSTER", ClusterHash::Random, false),
+                            vec!["SLOTS"],
+                        )
+                        .await
+                        .unwrap();
+                    let listed = match &slots {
+                        Value::Array(sets) => sets
+                            .iter()
+                            .all(|set| matches!(set, Value::Array(set) if set.len() >= 4)),
+                        _ => false,
+                    };
+                    if listed {
+                        break;
+                    }
+                    // Up to 30 s: slow under the full suite's load.
+                    assert!(
+                        attempt < 1500,
+                        "the replicas are not in the topology: {slots:?}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
-                // Up to 30 s: slow under the full suite's load.
-                assert!(
-                    attempt < 1500,
-                    "the replicas are not in the topology: {slots:?}"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             // And each replica is in sync.
             for replica in &nodes[3..] {
@@ -10772,17 +10772,28 @@ impl RedisCluster {
     }
 }
 
-/// Waits for the next hour when less than `margin` is left of this one: a test whose counters
-/// of an hour must stay in one window, on both binaries.
-async fn clear_of_an_hour_boundary(margin: std::time::Duration) {
+/// Waits for the next `window` (whole seconds: a minute, an hour) when less than `margin` is
+/// left of this one: a test whose counters of that window must stay in one window, on both
+/// binaries.
+async fn clear_of_a_window_boundary(window: std::time::Duration, margin: std::time::Duration) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
-    let left = std::time::Duration::from_secs(3600 - now.as_secs() % 3600)
+    let left = std::time::Duration::from_secs(window.as_secs() - now.as_secs() % window.as_secs())
         - std::time::Duration::from_nanos(now.subsec_nanos().into());
     if left < margin {
         tokio::time::sleep(left + std::time::Duration::from_millis(5)).await;
     }
+}
+
+/// Waits for the next minute when less than 2 s is left of this one: requests whose hits on
+/// `LLM_CONFIG`'s limit (2 a minute) must be counted in one window, on both binaries.
+async fn clear_of_a_minute_boundary() {
+    clear_of_a_window_boundary(
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(2),
+    )
+    .await;
 }
 
 /// Waits for the start of the next second of the system's clock.
@@ -10928,7 +10939,11 @@ async fn cluster_runs(
     masked: &[(String, &str)],
 ) {
     // Both binaries' counters of an hour, their pools filling: a minute or two.
-    clear_of_an_hour_boundary(std::time::Duration::from_secs(180)).await;
+    clear_of_a_window_boundary(
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_secs(180),
+    )
+    .await;
     let upstream = cluster_run(&upstream_binary(), cluster, variables, masked).await;
     let ours = cluster_run(
         std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
@@ -11321,7 +11336,11 @@ fn a_redis_sentinel_serves_like_upstream() {
 
 async fn sentinel_serves_like_upstream() {
     // Both binaries' counters of an hour, a failover each: a few minutes at most.
-    clear_of_an_hour_boundary(std::time::Duration::from_secs(300)).await;
+    clear_of_a_window_boundary(
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_secs(300),
+    )
+    .await;
     let runtime = temp_dir("sentinel-runtime");
     write_tree(
         &runtime,
@@ -11396,6 +11415,8 @@ async fn sentinel_serves_like_upstream() {
             }
             answers.push(format!("{response:?}"));
         };
+        // Each group of answers in one second: the burst limit's remaining counts it.
+        at_a_new_second().await;
         for _ in 0..2 {
             ask(&mut answers, "a").await;
         }
@@ -11425,6 +11446,7 @@ async fn sentinel_serves_like_upstream() {
             }
             assert_eq!(in_a_row, 3, "no answer from the new primary");
         }
+        at_a_new_second().await;
         for _ in 0..3 {
             ask(&mut answers, "a").await;
         }
@@ -14751,13 +14773,13 @@ async fn quota_lookups_read_memcached() {
     clock.0.store(1_000_000_000, Ordering::SeqCst);
     let alice = || request("d", &[&[("user", "alice")]]);
     service.should_rate_limit(&alice()).await.unwrap();
-    // The increment goes after the answer.
-    let weekly = "{d_user_alice_}_fx604800o345600_999475200_weekly";
+    // The increments go after the answer, each counted once memcached has answered it: a key
+    // it shows may not be counted yet.
     for _ in 0..100 {
-        if memcached
-            .ask(&format!("get {weekly}\r\n"))
-            .await
-            .starts_with("VALUE")
+        if stats
+            .snapshot()
+            .get("ratelimit.memcache.add.__code=success")
+            == Some(&2)
         {
             break;
         }
