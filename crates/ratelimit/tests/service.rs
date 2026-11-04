@@ -546,10 +546,6 @@ async fn client_limit_metadata_shows_the_unit_multiplier() {
         "requests_per_unit:10 unit:HOUR unit_multiplier:{value:5}"
     );
     assert_eq!(
-        limit_text(limit(Some(0))).await,
-        "requests_per_unit:10 unit:HOUR unit_multiplier:{}"
-    );
-    assert_eq!(
         limit_text(limit(None)).await,
         "requests_per_unit:10 unit:HOUR"
     );

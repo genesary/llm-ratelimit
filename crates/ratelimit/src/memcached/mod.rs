@@ -405,10 +405,11 @@ fn counter(item: &client::Item) -> Result<u64, ()> {
         .map_err(|_| ())
 }
 
-/// `memcacheExpiration`: past 30 days, the Unix time it ends (as an `int32`).
+/// `memcacheExpiration`: past 30 days, the Unix time it ends, as an `int32`: at most its largest,
+/// since a wrapped one would be expired already.
 fn expiration_for(seconds: i64, now: i64) -> i32 {
     if seconds > MAX_RELATIVE_EXPIRATION {
-        now.wrapping_add(seconds) as i32
+        now.saturating_add(seconds).min(i32::MAX.into()) as i32
     } else {
         seconds as i32
     }

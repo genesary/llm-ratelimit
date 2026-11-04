@@ -42,22 +42,37 @@ impl Window {
     /// and how many of them it lasts (D13).
     pub fn unit(&self) -> (Unit, u32) {
         let duration = self.duration();
-        let units = [
-            (Unit::Year, 365 * 86_400),
-            (Unit::Month, 30 * 86_400),
-            (Unit::Week, 7 * 86_400),
-            (Unit::Day, 86_400),
-            (Unit::Hour, 3_600),
-            (Unit::Minute, 60),
-            (Unit::Second, 1),
-        ];
-        let (unit, length) = units
+        let (unit, length) = UNITS
             .into_iter()
             .find(|(_, length)| duration % length == 0)
             .expect("a whole number of seconds");
         (unit, (duration / length) as u32)
     }
+
+    /// A client-sent limit's window of `multiplier` units, from the epoch (D23); `None` if
+    /// it has no such window: no unit, a multiplier of 0, or longer than a window may be.
+    pub(super) fn of_units(unit: Unit, multiplier: u32) -> Option<Self> {
+        let (_, length) = UNITS.into_iter().find(|(u, _)| *u == unit)?;
+        let duration = length * i64::from(multiplier);
+        (1..=MAX_DURATION)
+            .contains(&duration)
+            .then_some(Window::Fixed(FixedWindow {
+                duration,
+                origin: Origin::Epoch,
+            }))
+    }
 }
+
+/// The units, longest first, and their lengths in seconds.
+const UNITS: [(Unit, i64); 7] = [
+    (Unit::Year, 365 * 86_400),
+    (Unit::Month, 30 * 86_400),
+    (Unit::Week, 7 * 86_400),
+    (Unit::Day, 86_400),
+    (Unit::Hour, 3_600),
+    (Unit::Minute, 60),
+    (Unit::Second, 1),
+];
 
 /// A `fixed` window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

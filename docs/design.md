@@ -138,7 +138,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 
 **D22. `near_limit` and `over_limit` stats.** Exact legacy arithmetic: `nearLimitThreshold = floor(float64(float32(limit) × float32(ratio)))`, split of `hitsAddend` between `near_limit` and `over_limit`, `within_limit` only when `OK`. Usage before and after the request, per type: `token_bucket`, capacity − remaining (can exceed capacity while in debt); `sliding`, raw sum of the sub-buckets; `anchored`, 0 before opening.
 
-**D23. Client-sent `limit`** *(amended)*. If the domain is known: **one** fixed window of `unit × unit_multiplier`, which **replaces all** configured limits of the descriptor; no inherited `shadow_mode`, `unlimited` or `replaces`, global shadow applied; counting mode of the matching rule if there is one, otherwise `envoy`; legacy key if the multiplier is 1, a key including the duration otherwise. Reading, echoing and rejecting a multiplier of 0 are **extensions** (the reference ignores the field), as is looking up the rule for the mode.
+**D23. Client-sent `limit`** *(amended)*. If the domain is known: **one** fixed window of `unit × unit_multiplier`, which **replaces all** configured limits of the descriptor; no inherited `shadow_mode`, `unlimited` or `replaces`, global shadow applied; counting mode of the matching rule if there is one, otherwise `envoy`; legacy key if the multiplier is 1, a key including the duration otherwise; a window over `2^32 − 1` seconds refused, as in `rate_limits:`. Reading, echoing as sent and rejecting a multiplier of 0 are **extensions** (the reference ignores the field), as is looking up the rule for the mode.
 
 ---
 
