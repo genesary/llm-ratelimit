@@ -12784,6 +12784,69 @@ async fn memcached_run(
     }
 }
 
+/// On Memcached, a list limit's key past 250 − 64 bytes without its window's start and the
+/// request's values is warned about at load (ADR 0001): `{p%25llm_plan_<value>_}_fx3600_n` is
+/// 25 bytes and the value, and 3 more under `a` with no value. A `rate_limit:` key keeps upstream's silence, and so does Redis.
+#[tokio::test]
+async fn long_memcached_keys_are_warned_about_at_load() {
+    if !memcached_available() {
+        return;
+    }
+    let (fits, past, legacy) = ("v".repeat(161), "w".repeat(162), "x".repeat(300));
+    let (nested_fits, nested_past) = ("y".repeat(158), "z".repeat(159));
+    let list = |value: &str| {
+        format!(
+            "  - key: plan\n    value: {value}\n    rate_limits:\n      - {{name: n, requests_per_unit: 1, window: {{type: fixed, duration: 1h}}}}\n"
+        )
+    };
+    let config = format!(
+        "domain: llm\ndescriptors:\n{}{}  - key: plan\n    value: {legacy}\n    rate_limit: {{unit: hour, requests_per_unit: 1}}\n  - key: a\n    descriptors:\n{}{}",
+        list(&fits),
+        list(&past),
+        list(&nested_fits)
+            .replace("\n  ", "\n    ")
+            .replacen("  -", "    -", 1),
+        list(&nested_past)
+            .replace("\n  ", "\n    ")
+            .replacen("  -", "    -", 1)
+    );
+    let runtime = temp_dir("memcached-long-keys");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", config.as_bytes()),
+            ("current", b"->v1"),
+        ],
+    );
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_ratelimit"));
+    let memcached = Memcached::start().await;
+    let statsd = StatsdServer::start().await;
+    let mut environment = memcached_environment(&runtime, &memcached.address, &statsd);
+    environment.push(("CACHE_KEY_PREFIX", "p%".into()));
+    let grpc = environment
+        .iter()
+        .find(|(k, _)| *k == "GRPC_PORT")
+        .unwrap()
+        .1
+        .clone();
+    let stderr = logged_run(&binary, &environment, &format!("http://127.0.0.1:{grpc}")).await;
+    assert!(stderr.contains(&format!("llm.plan_{past}~n: ")), "{stderr}");
+    assert!(
+        stderr.contains(&format!("llm.a.plan_{nested_past}~n: ")),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("takes 187 bytes").count(), 2, "{stderr}");
+    assert!(!stderr.contains(&fits), "{stderr}");
+    assert!(!stderr.contains(&nested_fits), "{stderr}");
+    assert!(!stderr.contains(&legacy), "{stderr}");
+    let redis = Redis::start().await;
+    environment.push(("BACKEND_TYPE", "redis".into()));
+    environment.push(("REDIS_SOCKET_TYPE", "tcp".into()));
+    environment.push(("REDIS_URL", redis.address.clone()));
+    let stderr = logged_run(&binary, &environment, &format!("http://127.0.0.1:{grpc}")).await;
+    assert!(!stderr.contains(&past), "{stderr}");
+}
+
 /// `BACKEND_TYPE=memcache` as upstream's: the counters read, the answer, then the increments
 /// (`incr`, else `add` with the window's expiration: past 30 days, a year's, a Unix time; a
 /// calendar month's, until its end); a refund's `decr`; the local cache skipping memcached for a key

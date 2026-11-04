@@ -406,7 +406,7 @@ Not upstream's: what `docs/design.md` adds (B and C). Proven by tests of their o
 | `sliding` and `sliding_approx` (D10), `token_bucket` (D11) | ⬜ | refused at load for now |
 | The shipped Prometheus mapper: a list limit's `~name` in a `limit` label, one key and deeper, `opened_without_hits` mapped (D29); upstream's globs rewritten as regexes after those rules, every other stat mapped as upstream's default mapper maps it | ✅ | `the_default_mapper_labels_list_limits`, `the_shipped_mapper_maps_upstream_stats_like_upstream` |
 | The shipped Prometheus mapper's `total_capped_hits` (D11, D29) | ⬜ | with `token_bucket` |
-| Memcached: a warning at load when a list key's static part exceeds 250 − 64 bytes (ADR 0001) | ⬜ | |
+| Memcached: a warning at load when a list key's static part exceeds 250 − 64 bytes (ADR 0001) | ✅ | `long_memcached_keys_are_warned_about_at_load` |
 | A client-sent `limit` with `unit_multiplier` (D23): read, applied, echoed, 0 refused | ⬜ | ignored, as upstream |
 | Quota lookup (ADR 0003): `POST /quota` on the HTTP port; every limit of every descriptor (`replaces` and a client `limit` resolved as in a decision, unlimited ones, none for an unmatched descriptor), its window, `used`, `remaining`, `used_pct`, `resets_at`, `resets_in_s`, an anchored session's `open` (closed: no reset); 400, 404, 405, 500 | ✅ | `quota_lookups_show_every_limit`, `quota_lookups_resolve_rules_as_decisions_do`, `quota_lookups_are_served_over_http` |
 | Quota lookup changes nothing: reads only (`GET`, `HMGET`), keys, TTLs and rate-limit stats untouched, no local cache access | ✅ | `quota_lookups_change_nothing` |

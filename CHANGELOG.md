@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Added
 
 - The image is also tagged with a `v`, like the git tag: `v0.1.0` and `v0.1` next to `0.1.0` and `0.1`.
+- On Memcached, a warning at load names a `rate_limits:` limit whose key leaves under 64 of memcached's 250 bytes for its window's start and the request's values.
 
 ## [0.1.0] - 2026-10-30
 

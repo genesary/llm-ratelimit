@@ -2,8 +2,8 @@
 //! fixed windows. A port of envoyproxy/ratelimit `src/limiter/{base_limiter,cache_key}.go`
 //! and the time helpers of `src/utils`.
 
-use crate::config::RateLimit;
 use crate::config::window::Window;
+use crate::config::{RateLimit, escape_hash_tag};
 use crate::service::CacheError;
 use crate::stats::RateLimitStats;
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescriptor;
@@ -142,16 +142,11 @@ pub fn cache_key(
         key += &window_start(limit.limit.unit(), now, calendar)?.to_string();
         return Ok(key);
     };
-    let escape = |text: &str| {
-        text.replace('%', "%25")
-            .replace('{', "%7B")
-            .replace('}', "%7D")
-    };
-    let mut key = format!("{{{}{}_", escape(prefix), escape(domain));
+    let mut key = format!("{{{}{}_", escape_hash_tag(prefix), escape_hash_tag(domain));
     for (k, v) in key_entries(descriptor, limit) {
-        key += &escape(k);
+        key += &escape_hash_tag(k);
         key += "_";
-        key += &escape(v);
+        key += &escape_hash_tag(v);
         key += "_";
     }
     key += &format!("}}_{}_", window.shape());

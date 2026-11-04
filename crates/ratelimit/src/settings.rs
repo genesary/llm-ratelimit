@@ -517,6 +517,7 @@ impl Settings {
             merge_domain_configs: self.merge_domain_config,
             sanitize_descriptor_metric_dots: self.sanitize_descriptor_metric_dots,
             memcached: self.backend_type == "memcache",
+            cache_key_prefix: self.cache_key_prefix.clone(),
         }
     }
 

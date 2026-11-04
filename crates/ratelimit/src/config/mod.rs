@@ -29,7 +29,13 @@ pub struct LoadOptions {
     pub sanitize_descriptor_metric_dots: bool,
     /// `BACKEND_TYPE=memcache`: only `fixed` windows can be counted (D24).
     pub memcached: bool,
+    /// `CACHE_KEY_PREFIX`, part of the keys whose length is warned about on Memcached.
+    pub cache_key_prefix: String,
 }
+
+/// What a list key may take on Memcached without its window's start and the request's values,
+/// which get the other 64 of its 250 bytes (ADR 0001).
+const MEMCACHED_STATIC_KEY_BYTES: usize = 250 - 64;
 
 /// A config error, formatted like envoyproxy/ratelimit's `RateLimitConfigError`: `<file>: <message>`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -194,9 +200,15 @@ fn load_roots(
             false => crate::debug!("loading domain: {}", root.domain),
         }
         let domain = config.domains.entry(root.domain.clone()).or_default();
+        let key_start = format!(
+            "{{{}{}_",
+            escape_hash_tag(&options.cache_key_prefix),
+            escape_hash_tag(&root.domain)
+        );
         domain.load_descriptors(
             name,
             &format!("{}.", root.domain),
+            &key_start,
             &root.descriptors,
             options,
         )?;
@@ -414,10 +426,18 @@ fn load_overflow(file: &str, full_key: &str, config: &YamlDescriptor) -> Result<
     Err(ConfigError::new(file, format!("{full_key}: {message}")))
 }
 
+/// `text` as it is written in a list key's hash tag (ADR 0001).
+pub(crate) fn escape_hash_tag(text: &str) -> String {
+    text.replace('%', "%25")
+        .replace('{', "%7B")
+        .replace('}', "%7D")
+}
+
 /// A descriptor's `rate_limits:` (D7): named limits, each with its window.
 fn load_list(
     file: &str,
     full_key: &str,
+    key_start: &str,
     config: &YamlDescriptor,
     options: &LoadOptions,
 ) -> Result<Vec<RateLimit>, ConfigError> {
@@ -473,6 +493,13 @@ fn load_list(
         if options.memcached && !matches!(window, Window::Fixed(_)) {
             return Err(error("only fixed windows can be counted on Memcached"));
         }
+        // `<hash tag>}_<shape>_<name>`, the window's start left out.
+        let static_bytes = key_start.len() + 2 + window.shape().len() + 1 + entry.name.len();
+        if options.memcached && static_bytes > MEMCACHED_STATIC_KEY_BYTES {
+            crate::log::warn(&format!(
+                "{file}: {at}: its key takes {static_bytes} bytes before its window's start and the request's values: memcached refuses a key over 250 bytes, which then counts nothing"
+            ));
+        }
         crate::debug!("Creating stats for key: '{at}'");
         let (unit, multiplier) = window.unit();
         let mut limit = RateLimit {
@@ -500,6 +527,7 @@ impl Descriptor {
         &mut self,
         file: &str,
         parent_key: &str,
+        key_start: &str,
         descriptors: &[YamlDescriptor],
         options: &LoadOptions,
     ) -> Result<(), ConfigError> {
@@ -520,7 +548,12 @@ impl Descriptor {
                 ));
             }
             let limit = load_limit(file, &new_parent_key, config)?;
-            let list = load_list(file, &new_parent_key, config, options)?;
+            let key_start = format!(
+                "{key_start}{}_{}_",
+                escape_hash_tag(&config.key),
+                escape_hash_tag(&config.value)
+            );
+            let list = load_list(file, &new_parent_key, &key_start, config, options)?;
             load_overflow(file, &new_parent_key, config)?;
             if config.share_threshold && !final_key.contains('*') {
                 return Err(ConfigError::new(
@@ -555,6 +588,7 @@ impl Descriptor {
             descriptor.load_descriptors(
                 file,
                 &format!("{new_parent_key}."),
+                &key_start,
                 &config.descriptors,
                 options,
             )?;
