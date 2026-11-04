@@ -664,12 +664,14 @@ impl RateLimitConfig {
             // envoy.type.v3.RateLimitUnit shares its numbering with the response unit.
             let key = self.descriptor_key(domain, descriptor);
             crate::debug!("Creating stats for key: '{key}'");
-            return LimitLookup::Limit(RateLimit::new(
-                key,
-                limit.requests_per_unit,
-                limit.unit,
-                String::new(),
-            ));
+            let mut custom =
+                RateLimit::new(key, limit.requests_per_unit, limit.unit, String::new());
+            // D23: a multiplier of 1 is none. One with no window is refused by the service.
+            if let Some(multiplier) = limit.unit_multiplier.filter(|m| *m != 1) {
+                custom.limit.unit_multiplier = Some(multiplier);
+                custom.window = Window::of_units(custom.limit.unit(), multiplier);
+            }
+            return LimitLookup::Limit(custom);
         }
         // The limits found, and whether they are a `rate_limits:` list.
         let mut found: Option<(Vec<RateLimit>, bool)> = None;

@@ -9,6 +9,10 @@ All notable changes to this project are documented here. The format follows [Kee
 - The image is also tagged with a `v`, like the git tag: `v0.1.0` and `v0.1` next to `0.1.0` and `0.1`.
 - On Memcached, a warning at load names a `rate_limits:` limit whose key leaves under 64 of memcached's 250 bytes for its window's start and the request's values.
 
+### Changed
+
+- A client-sent `limit`'s `unit_multiplier` is now applied, where it was ignored: one fixed window of that many units. A multiplier of 0, or a window over 2^32 − 1 seconds, is refused.
+
 ## [0.1.0] - 2026-10-30
 
 The first release.

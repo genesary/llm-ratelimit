@@ -53,7 +53,7 @@ grpcurl -plaintext \
 | `entries` | list of `{key, value}` | Matched against the configuration's `descriptors`, as [configuration.md](configuration.md#how-a-request-matches) describes. |
 | `hits_addend` | uint64, optional | This descriptor's hits. When set, it replaces the request's `hits_addend`, and 0 means 0: a **check**. |
 | `is_negative_hits` | bool | A **refund**: the hits are taken back instead of added. |
-| `limit` | `{requests_per_unit, unit, unit_multiplier}` | A limit sent by the client. It replaces the configured limits of this descriptor: see [configuration.md](configuration.md#a-limit-sent-by-the-client). `unit_multiplier` is accepted but not applied: the window is one `unit`. |
+| `limit` | `{requests_per_unit, unit, unit_multiplier}` | A limit sent by the client. It replaces the configured limits of this descriptor: see [configuration.md](configuration.md#a-limit-sent-by-the-client). `unit_multiplier` makes the window that many `unit`s: an extension of Envoy's API that upstream ignores. |
 
 Each descriptor is decided on its own, with its own limits. The request's answer combines them, [below](#the-response).
 
@@ -97,13 +97,13 @@ agentgateway, for example, sends a check before calling a model, then an **amend
 | Field | Meaning |
 |---|---|
 | `code` | `OK` or `OVER_LIMIT`, after the descriptor's `shadow_mode`. |
-| `current_limit` | The limit that decided: `requests_per_unit`, `unit`, and for a `rate_limits:` limit its `name` and `unit_multiplier`. Absent when no limit applies. |
+| `current_limit` | The limit that decided: `requests_per_unit`, `unit`, for a `rate_limits:` limit its `name` and `unit_multiplier`, and for a client-sent limit the `unit_multiplier` it sent, unless it is 1. Absent when no limit applies. |
 | `limit_remaining` | Hits left in the window, 0 when over the limit. `4294967295` (the largest uint32) for an `unlimited` descriptor. |
 | `duration_until_reset` | Time until the window ends, in whole seconds. Absent when no limit applies. |
 
 **A `rate_limits:` list** has several limits but one status. The status is the list's **representative status**: of the limits over, the one whose reset is furthest away; otherwise the one with the fewest hits remaining; on a tie, the first in the list. `current_limit`, `limit_remaining` and `duration_until_reset` all come from that limit. See [configuration.md](configuration.md#decisions-with-several-limits).
 
-A window is reported as the largest unit dividing its duration, with `unit_multiplier` when the multiplier is not 1: a `5h` window is `HOUR` with `unit_multiplier: 5`, a `7d` window is `WEEK`. `unit_multiplier` is an extension of Envoy's API that clients may ignore. A `rate_limit:` limit has no `name` unless the YAML gives one, and never a `unit_multiplier`.
+A window is reported as the largest unit dividing its duration, with `unit_multiplier` when the multiplier is not 1: a `5h` window is `HOUR` with `unit_multiplier: 5`, a `7d` window is `WEEK`. `unit_multiplier` is an extension of Envoy's API that clients may ignore. A `rate_limit:` limit has no `name` unless the YAML gives one, and never a `unit_multiplier`. A client-sent limit is reported as it was sent: `DAY` × 7 stays `DAY` with `unit_multiplier: 7`.
 
 ```json
 {

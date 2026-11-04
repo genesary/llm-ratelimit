@@ -318,6 +318,20 @@ impl<C: RateLimitCache> RateLimitService<C> {
                 "invalid rate limit unit UNKNOWN".into(),
             ));
         }
+        // A client limit whose multiplier gives no window (D23); a configured limit with a
+        // multiplier always has one.
+        let impossible = plans.iter().find_map(|plan| match plan {
+            Plan::Limits(limits) => limits
+                .iter()
+                .find(|l| l.window.is_none())
+                .and_then(|l| l.limit.unit_multiplier),
+            Plan::Unlimited(_) => None,
+        });
+        if let Some(multiplier) = impossible {
+            return Err(ServiceError::InvalidArgument(format!(
+                "invalid rate limit unit_multiplier {multiplier}"
+            )));
+        }
         let limits = plans
             .iter()
             .map(|plan| match plan {

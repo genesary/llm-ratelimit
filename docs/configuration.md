@@ -488,13 +488,14 @@ As upstream does, a limit's `metadata` is left out of the response when the desc
 
 ## A limit sent by the client
 
-A request's descriptor can carry its own limit (`RateLimitDescriptor.limit`: `requests_per_unit` and `unit`), which Envoy builds from its route configuration. It replaces what the configuration says for that descriptor:
+A request's descriptor can carry its own limit (`RateLimitDescriptor.limit`: `requests_per_unit`, `unit` and `unit_multiplier`), which Envoy builds from its route configuration. It replaces what the configuration says for that descriptor:
 
 - It applies whenever the domain is configured, even if the descriptor matches no configured descriptor. A request for an unknown domain still gets no limit.
-- It replaces a `rate_limit:` and a [`rate_limits:`](#rate_limits) list alike, by one limit of the unit sent.
+- It replaces a `rate_limit:` and a [`rate_limits:`](#rate_limits) list alike, by one limit of the unit sent, times its `unit_multiplier`.
 - None of the configured descriptor's keys apply: no `shadow_mode`, `quota_mode`, `detailed_metric`, `metadata` or `replaces`. It has no name, so it is never replaced.
 - Its stats are named after the request's entries: `domain.key1_value1.key2`, an entry without a value by its key alone.
-- A `unit` of `UNKNOWN` is a gRPC `INVALID_ARGUMENT` error (upstream's process crashes there). A `unit_multiplier` is not applied.
+- A `unit` of `UNKNOWN` is a gRPC `INVALID_ARGUMENT` error (upstream's process crashes there).
+- A `unit_multiplier` other than 1 makes it one `fixed` window of that many units, from the epoch, with its own key, counted like a [`rate_limits:`](#rate_limits) limit: `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` does not apply. A multiplier of 0, or a window over `4294967295` seconds, is a gRPC `INVALID_ARGUMENT` error and a `400` on `/json` and `/quota`. Upstream ignores the field.
 
 The fields are described in [api.md](api.md).
 

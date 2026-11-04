@@ -5830,6 +5830,9 @@ descriptors:
     assert_eq!(simplify(&upstream).0, "400 Bad Request");
     let ours = simplify(&send(services[1].http.clone(), "POST", "/json", multiplier.into()).await);
     assert_eq!(ours.0, "200 OK");
+    let no_window = multiplier.replace(r#""unitMultiplier":2"#, r#""unitMultiplier":0"#);
+    let refused = simplify(&send(services[1].http.clone(), "POST", "/json", no_window).await);
+    assert_eq!(refused.0, "400 Bad Request");
     assert!(
         ours.2.contains("unit:HOUR unit_multiplier:{value:2}"),
         "{}",
@@ -13395,6 +13398,237 @@ descriptors:
         window: {type: fixed, duration: 7d, offset: 4d}
 ";
 
+/// A request for `alice` with a client limit of 1 an hour × `multiplier` (D23).
+fn client_limit(multiplier: Option<u32>) -> RateLimitRequest {
+    use ratelimit_proto::envoy::extensions::common::ratelimit::v3::rate_limit_descriptor::RateLimitOverride;
+    use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::rate_limit::Unit;
+    let mut request = request("d", &[&[("user", "alice")]]);
+    request.descriptors[0].limit = Some(RateLimitOverride {
+        requests_per_unit: 1,
+        unit: Unit::Hour as i32,
+        unit_multiplier: multiplier,
+    });
+    request
+}
+
+/// A client limit's `unit_multiplier` is one fixed window of that many units, in a key with its
+/// duration, and echoed (D23).
+#[tokio::test]
+async fn client_limits_apply_their_unit_multiplier() {
+    use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::rate_limit::Unit;
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(WEEK_AND_FIVE_HOURS, Settings::default()).await;
+    let answer = async |now: i64| {
+        h.at(now);
+        let response = h.call(client_limit(Some(2))).await;
+        let status = response.statuses[0].clone();
+        let limit = status.current_limit.clone().unwrap();
+        (
+            format!("{:?}", status.code()),
+            limit.unit(),
+            limit.unit_multiplier,
+            status.limit_remaining,
+            status.duration_until_reset.unwrap().seconds,
+        )
+    };
+    // The 2 h windows start at multiples of 7200: 999993600, 1000000800.
+    assert_eq!(
+        answer(999_994_000).await,
+        ("Ok".to_string(), Unit::Hour, Some(2), 0, 6800)
+    );
+    // Past the hour, in the same window.
+    assert_eq!(
+        answer(999_998_000).await,
+        ("OverLimit".to_string(), Unit::Hour, Some(2), 0, 2800)
+    );
+    assert_eq!(
+        h.keys().await,
+        BTreeMap::from([(
+            "{d_user_alice_}_fx7200_999993600_".to_string(),
+            ("2".to_string(), 7200)
+        )])
+    );
+    assert_eq!(
+        answer(1_000_000_800).await,
+        ("Ok".to_string(), Unit::Hour, Some(2), 0, 7200)
+    );
+    // The quota lookup reads the same window.
+    let lookup = h
+        .subject
+        .service
+        .lookup(&client_limit(Some(2)))
+        .await
+        .unwrap();
+    let rendered: serde_json::Value =
+        serde_json::from_str(&ratelimit::quota::render(&lookup)).unwrap();
+    assert_eq!(
+        rendered["descriptors"][0]["limits"][0]["window"],
+        serde_json::json!({"type": "fixed", "duration_s": 7200})
+    );
+    assert_eq!(rendered["descriptors"][0]["limits"][0]["used"], 1);
+}
+
+/// A multiplier of 1 is no multiplier: upstream's key, and none echoed (D13, D23).
+#[tokio::test]
+async fn a_client_limit_multiplied_by_one_is_a_plain_one() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(WEEK_AND_FIVE_HOURS, Settings::default()).await;
+    h.at(1_000_000_000);
+    let response = h.call(client_limit(Some(1))).await;
+    let limit = response.statuses[0].current_limit.clone().unwrap();
+    assert_eq!(limit.unit_multiplier, None);
+    assert_eq!(
+        h.keys().await.into_keys().collect::<Vec<_>>(),
+        ["d_user_alice_999997200"]
+    );
+}
+
+/// A multiplier of 0, or a window over `u32::MAX` seconds as in `rate_limits:`, is a bad
+/// request, also for the quota lookup; on an unknown domain no limit applies, as for any
+/// client limit.
+#[tokio::test]
+async fn client_limits_with_an_impossible_multiplier_are_refused() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(WEEK_AND_FIVE_HOURS, Settings::default()).await;
+    h.at(1_000_000_000);
+    for multiplier in [0, 1_193_047] {
+        let request = client_limit(Some(multiplier));
+        let error = h.subject.service.should_rate_limit(&request).await;
+        assert_eq!(
+            error.err().map(|e| e.to_string()),
+            Some(format!("invalid rate limit unit_multiplier {multiplier}"))
+        );
+        assert!(h.subject.service.lookup(&request).await.is_err());
+        let mut elsewhere = request;
+        elsewhere.domain = "unknown".into();
+        assert!(
+            h.subject
+                .service
+                .should_rate_limit(&elsewhere)
+                .await
+                .is_ok()
+        );
+    }
+    // The longest: 1193046 hours is under 2^32 seconds.
+    let response = h.call(client_limit(Some(1_193_046))).await;
+    assert_eq!(
+        response.statuses[0]
+            .current_limit
+            .as_ref()
+            .unwrap()
+            .unit_multiplier,
+        Some(1_193_046)
+    );
+    assert_eq!(h.keys().await.len(), 1);
+}
+
+/// On Memcached too (D23, D24): the key with its duration. A window ending past what memcached's
+/// `int32` expiration can say ends at its largest: a wrapped one would be already expired.
+#[tokio::test]
+async fn client_limits_apply_their_unit_multiplier_on_memcached() {
+    if !memcached_available() {
+        return;
+    }
+    let memcached = Memcached::start().await;
+    let servers = ratelimit::memcached::client::resolve(std::slice::from_ref(&memcached.address))
+        .await
+        .unwrap();
+    let client = Arc::new(ratelimit::memcached::client::Client::new(servers, 2, None));
+    let clock = Arc::new(ManualClock::default());
+    let stats = Arc::new(Stats::default());
+    let cache = ratelimit::memcached::MemcacheCache::new(
+        client,
+        clock.clone(),
+        stats.clone(),
+        &stats.scope_with_tags("ratelimit"),
+        CacheSettings::default(),
+        None,
+    );
+    let service = RateLimitService::new(cache, clock.clone(), stats, ServiceSettings::default());
+    let file = ConfigFile {
+        name: "config.yaml".into(),
+        content: WEEK_AND_FIVE_HOURS.into(),
+    };
+    service.set_config(config::load(&[file], &LoadOptions::default()).unwrap());
+    clock.0.store(999_994_000, Ordering::SeqCst);
+    let response = service
+        .should_rate_limit(&client_limit(Some(2)))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.statuses[0]
+            .duration_until_reset
+            .as_ref()
+            .unwrap()
+            .seconds,
+        6800
+    );
+    // The increment goes after the answer.
+    let mut answer = String::new();
+    for _ in 0..100 {
+        answer = memcached
+            .ask("get {d_user_alice_}_fx7200_999993600_\r\n")
+            .await;
+        if answer.starts_with("VALUE") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(answer.starts_with("VALUE"), "{answer}");
+    // 105000 h from 2027 is past 2038.
+    clock.0.store(1_800_000_000, Ordering::SeqCst);
+    service
+        .should_rate_limit(&client_limit(Some(105_000)))
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        answer = memcached
+            .ask("get {d_user_alice_}_fx378000000_1512000000_\r\n")
+            .await;
+        if answer.starts_with("VALUE") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(answer.starts_with("VALUE"), "{answer}");
+}
+
+/// A client limit's window of several units is its own unit in the headers (D13, D23).
+#[tokio::test]
+async fn client_limits_with_a_multiplier_have_headers_of_their_own() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        service: ServiceSettings {
+            per_unit_headers: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(WEEK_AND_FIVE_HOURS, settings).await;
+    h.at(1_000_000_000);
+    let response = h.call(client_limit(Some(2))).await;
+    let headers: BTreeMap<String, String> = response
+        .response_headers_to_add
+        .into_iter()
+        .map(|header| (header.key, header.value))
+        .collect();
+    assert_eq!(
+        headers,
+        BTreeMap::from([
+            ("RateLimit-Limit-2Hours".to_string(), "1".to_string()),
+            ("RateLimit-Remaining-2Hours".to_string(), "0".to_string()),
+        ])
+    );
+}
+
 /// Each limit of a list counts in its own key (ADR 0001), its window from the epoch or its
 /// offset; the descriptor's status is the representative one (D17): of those over, the
 /// longest to reset, else the fewest remaining. Each limit has its stats, named `~name` (D29).
@@ -13860,6 +14094,18 @@ descriptors:
             ),
         ])
     );
+    // A client limit with a multiplier counts like a list limit, under its limit too.
+    let mut multiplied = request("d", &[&[("user", "alice")], &[("org", "y")]]);
+    multiplied.descriptors[0].limit = client_limit(Some(2)).descriptors[0].limit.take();
+    multiplied.descriptors[0]
+        .limit
+        .as_mut()
+        .unwrap()
+        .requests_per_unit = 10;
+    for _ in 0..3 {
+        h.call(multiplied.clone()).await;
+    }
+    assert_eq!(h.keys().await["{d_user_alice_}_fx7200_999993600_"].0, "3");
 }
 
 /// On Memcached (D24), list limits count in ADR 0001's keys too, decided on what `GET` reads
