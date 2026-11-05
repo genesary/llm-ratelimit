@@ -1,5 +1,5 @@
-ratelimit
-Copyright 2026 The ratelimit authors
+llm-ratelimit
+Copyright 2026 The llm-ratelimit authors
 
 This product is a Rust port of envoyproxy/ratelimit and reproduces its behaviour.
 The licenses of the Rust crates it is built from are in THIRD-PARTY-LICENSES.txt, next to

@@ -26,11 +26,11 @@ envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit
 
 This is the API Envoy, Envoy Gateway and agentgateway call. The v2 API is not served. Each call is a **decision**: it counts the request's hits and answers OK or OVER_LIMIT.
 
-The server has no gRPC reflection. To call it with `grpcurl`, give it the protos: Envoy's API (`envoy/service/ratelimit/v3/rls.proto` and its imports), or the trimmed copies in this repository under `crates/ratelimit-proto/proto`.
+The server has no gRPC reflection. To call it with `grpcurl`, give it the protos: Envoy's API (`envoy/service/ratelimit/v3/rls.proto` and its imports), or the trimmed copies in this repository under `crates/llm-ratelimit-proto/proto`.
 
 ```sh
 grpcurl -plaintext \
-  -import-path crates/ratelimit-proto/proto \
+  -import-path crates/llm-ratelimit-proto/proto \
   -proto envoy/service/ratelimit/v3/rls.proto \
   -d '{"domain": "llm", "descriptors": [{"entries": [{"key": "user", "value": "alice"}]}]}' \
   localhost:8081 envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit
@@ -199,7 +199,7 @@ The gRPC port also serves `grpc.health.v1.Health`: `Check`, `Watch` and `List`.
 
 ```sh
 grpcurl -plaintext \
-  -import-path crates/ratelimit-proto/proto -proto grpc/health/v1/health.proto \
+  -import-path crates/llm-ratelimit-proto/proto -proto grpc/health/v1/health.proto \
   -d '{"service": "ratelimit"}' localhost:8081 grpc.health.v1.Health/Check
 ```
 
@@ -258,7 +258,7 @@ transport_socket:
 
 ```sh
 grpcurl -plaintext -unix \
-  -import-path crates/ratelimit-proto/proto -proto envoy/service/ratelimit/v3/rls.proto \
+  -import-path crates/llm-ratelimit-proto/proto -proto envoy/service/ratelimit/v3/rls.proto \
   -d '{"domain": "llm", "descriptors": [{"entries": [{"key": "user", "value": "alice"}]}]}' \
   /run/ratelimit/grpc.sock envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit
 ```

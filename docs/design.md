@@ -1,4 +1,4 @@
-# Design — `ratelimit` (Rust)
+# Design — `llm-ratelimit` (Rust)
 
 Reference document for the design decisions, from the design grilling of 2026-10-16. A decision marked *(amended)* was revised after it was first agreed. Format details are fixed in the ADRs:
 
@@ -177,7 +177,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 
 **D30. Stack** *(amended)*. tokio, tonic + prost, axum, serde, fred. TLS through `rustls`, for a binary without OpenSSL. The Prometheus listener is served by `hyper` directly, behind a port of Go's mux rules for its one path, rather than axum's router.
 
-**D31. Code layout** *(amended)*. A workspace of two crates: `ratelimit-proto` (flattened protos, compiled with `protox`, no `protoc`) and `ratelimit`. Seam by operations: `Store::apply(batch of ops {key, algo, limit, hits, now})`. Each algorithm of the new types is a pure function `step(state, op) → (state, result)` in Rust (in-memory backend), rewritten in Lua for Redis. **The legacy path stays an `INCRBY` + `EXPIRE` pipeline with the decision on the service side**, not a script, so the commands seen by Redis are identical. The decision layer (thresholds, shadow, quota, status reduction, response) is shared.
+**D31. Code layout** *(amended)*. A workspace of two crates: `llm-ratelimit-proto` (flattened protos, compiled with `protox`, no `protoc`) and `llm-ratelimit`. Seam by operations: `Store::apply(batch of ops {key, algo, limit, hits, now})`. Each algorithm of the new types is a pure function `step(state, op) → (state, result)` in Rust (in-memory backend), rewritten in Lua for Redis. **The legacy path stays an `INCRBY` + `EXPIRE` pipeline with the decision on the service side**, not a script, so the commands seen by Redis are identical. The decision layer (thresholds, shadow, quota, status reduction, response) is shared.
 
 **D32. Tests** *(amended)*.
 
@@ -188,7 +188,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 5. Differential test of the mapper against a real `statsd_exporter`, and of the raw statsd stream against the reference.
 6. TDD with the injectable clock for the new types, including the D9 opening matrix.
 
-**D33. Image** *(amended)*. Binary exactly at `/bin/ratelimit`, distroless without a shell, amd64 + arm64 (`cargo-zigbuild`). Any UID (Envoy Gateway forces 65534), read-only file system, no capabilities. Ports 8080 / 8081 / 6070, `RUNTIME_ROOT=/srv/runtime_data/current`. Explicit dual-stack listening (`[::]` with `IPV6_V6ONLY=0`) and `SO_REUSEPORT` on all three ports. `/healthcheck` served only after the initial Redis connection, as upstream. Every variable injected by Envoy Gateway is supported, except `GRPC_SERVER_TLS_CA_CERT`, **ignored as upstream** (no code reads it). Image signed with cosign, with SBOM and provenance; CI test on `kind` with a real Envoy Gateway where only the image is changed. No Helm chart in v1.
+**D33. Image** *(amended)*. Binary at `/bin/llm-ratelimit`, with `/bin/ratelimit` as a link to it, the path upstream's manifests call, distroless without a shell, amd64 + arm64 (`cargo-zigbuild`). Any UID (Envoy Gateway forces 65534), read-only file system, no capabilities. Ports 8080 / 8081 / 6070, `RUNTIME_ROOT=/srv/runtime_data/current`. Explicit dual-stack listening (`[::]` with `IPV6_V6ONLY=0`) and `SO_REUSEPORT` on all three ports. `/healthcheck` served only after the initial Redis connection, as upstream. Every variable injected by Envoy Gateway is supported, except `GRPC_SERVER_TLS_CA_CERT`, **ignored as upstream** (no code reads it). Image signed with cosign, with SBOM and provenance; CI test on `kind` with a real Envoy Gateway where only the image is changed. No Helm chart in v1.
 
 **D34. License.** Apache-2.0, a NOTICE file crediting envoy ratelimit and the Envoy API, vendored proto headers kept, dependency licenses generated with `cargo-about`.
 
