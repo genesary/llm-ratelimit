@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Added
 
 - The image is also tagged with a `v`, like the git tag: `v0.1.0` and `v0.1` next to `0.1.0` and `0.1`.
+- The agentgateway guide shows how to weigh tokens by the cache, in "Counting like Claude".
 - `token_bucket` windows refill continuously, with `burst` and `max_debt`.
 - `concurrency` windows limit the requests in flight per descriptor, with a required `lease`: a check takes a slot and an amendment releases it. See ADR 0004.
 - On Memcached, a warning at load names a `rate_limits:` limit whose key leaves under 64 of memcached's 250 bytes for its window's start and the request's values.

@@ -171,6 +171,43 @@ Choose the bucket if your load comes in surges at session resets, and the countd
 
 Leave the local cache off here too: an amendment on a bucket held there is not counted. `/quota` then shows `level`, negative in debt, `used_pct`, and `resets_in_s`, the time until it is full.
 
+## Counting like Claude
+
+By default a `tokens` descriptor counts `llm.totalTokens`. Cached input costs a GPU far less than fresh input, and output far more, so a `cost` can weigh them. Here cached input counts for a tenth, fresh input for 1, and output for 4. These weights are examples, to calibrate against your own hardware:
+
+```yaml
+      descriptors:
+      - entries:
+        - key: user
+          value: jwt.sub
+        type: tokens
+        cost: >-
+          int(default(llm.inputTokens, 0)) - int(default(llm.cachedInputTokens, 0))
+          + int(default(llm.cachedInputTokens, 0)) / 10
+          + 4 * int(default(llm.outputTokens, 0))
+```
+
+In an `AgentgatewayPolicy`, the same expression goes in the descriptor's `cost`, next to `unit: Tokens`.
+
+For 1000 tokens of input, 800 of them cached, and 100 of output, this counts 200 + 80 + 400 = 680, where `llm.totalTokens` would count 1100.
+
+- **`llm.inputTokens` includes the cached tokens,** whatever the provider reports, so the subtraction is right for all of them. `llm.providerInputTokens` is the raw figure, which is not.
+- **The `int()`s are needed:** token counts are unsigned, and CEL does not mix them with the integers of this expression. `/ 10` truncates.
+- **A failing expression skips the descriptor.** The check still passes, the amendment is not counted, and **that user is unlimited on this descriptor**, with only a debug line to say so. So does a negative result. Keep `default()` around every optional field, and watch that `total_hits` still grows.
+- **vLLM must run with `--enable-prompt-tokens-details`** to return `cached_tokens`. Without it, nothing is reported as cached, so everything counts as fresh: users are overcharged, and nothing fails.
+- **`cached_tokens` can be `null` despite the flag.** It has been reported on some versions, and vLLM's code allows it. `default()` treats it as none, so check that the count really arrives.
+
+**To check it on your deployment,** send the same long prompt twice, streaming with usage included, and read the last chunk's `usage`. The second answer should report `cached_tokens` close to `prompt_tokens`:
+
+```sh
+for i in 1 2; do
+  curl -sN "$VLLM/v1/chat/completions" -H 'content-type: application/json' -d "{
+    \"model\": \"$MODEL\", \"stream\": true, \"stream_options\": {\"include_usage\": true},
+    \"messages\": [{\"role\": \"user\", \"content\": \"$LONG_PROMPT\"}]
+  }" | grep '\"usage\":{' | tail -1
+done
+```
+
 ## Limiting requests in flight
 
 Volume quotas do not protect a busy GPU node from one harness sending many requests at once. A [`concurrency` window](../configuration.md#concurrency) limits what a user has in flight, per model, so that being limited on one model leaves the others free. It uses a second descriptor, and nothing else changes:
