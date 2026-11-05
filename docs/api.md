@@ -69,6 +69,7 @@ Each descriptor is decided on its own, with its own limits. The request's answer
 - **Every hit is counted, denied requests included.** A request that is over the limit still adds its hits, as upstream does, unless the [local cache](backends.md#the-local-cache) answers it. A descriptor whose limit is already reached stays over until its window ends.
 - **A descriptor is over its limit** when its counter, once this request's hits are added, is greater than `requests_per_unit`. A check (0 hits) is therefore OK while the counter is at most the limit, and OVER_LIMIT once it has gone past it.
 - **A `rate_limits:` list** counts the hits in every one of its limits.
+- **A [`token_bucket` window](configuration.md#token_bucket)** admits while it has any token left, however many hits the request has, and a refund gives tokens back.
 - **A [`concurrency` window](configuration.md#concurrency)** reads hits differently: 0 hits take a slot, and N hits, or a refund of N, release N slots.
 - **A refund** (`is_negative_hits: true`) subtracts the hits:
   - The counter never goes below 0.

@@ -62,13 +62,14 @@ The keys come out in alphabetical order; the example is reordered for reading.
 |---|---|
 | `now` | The instant of the snapshot, in UTC (RFC 3339, whole seconds). |
 | `name` | The limit's name. It is empty for a `rate_limit:` without one. |
-| `window` | `{"type": "fixed" \| "anchored", "duration_s": …}`, `{"type": "concurrency", "lease_s": …, "retry_after_s": …}`, or, for a `rate_limit:`, `{"type": "unit", "unit": "HOUR"}`. |
+| `window` | `{"type": "fixed" \| "anchored", "duration_s": …}`, `{"type": "concurrency", "lease_s": …, "retry_after_s": …}`, `{"type": "token_bucket", "duration_s": …, "burst": …}`, or, for a `rate_limit:`, `{"type": "unit", "unit": "HOUR"}`. |
 | `limit` | `requests_per_unit`. |
 | `used` | The hits counted in the current window. It can exceed `limit`, since denied hits are counted too (`overflow: envoy`). |
 | `remaining` | `limit − used`, never below 0. |
 | `used_pct` | `used / limit × 100`, to one decimal, and not capped (`103.5`). A limit of 0 shows 100 once used, else 0. |
 | `resets_at`, `resets_in_s` | When the current window ends, and how long from `now`. |
 | `open` | For anchored windows only: whether a session is open. |
+| `level` | For token buckets only: the whole tokens in the bucket, negative in debt. `limit` is then the capacity, `used` is `limit − level`, and `resets_in_s` the time until it is full, 0 when it is. |
 | `in_flight` | For concurrency windows only: the slots held, leaving out those past their lease. `used` and `used_pct` count them too. |
 | `shadow_mode`, `quota_mode` | The descriptor's flags. The figures are the same either way. |
 

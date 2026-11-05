@@ -312,6 +312,7 @@ impl<C: RateLimitCache> RateLimitService<C> {
             }
         };
         self.stats.config_load_success().inc();
+        self.stats.set_lasting_lockouts(config.lasting_lockouts());
         *self.config.write().unwrap() = Some(Arc::new(config));
         crate::log::info("Successfully loaded new configuration");
     }
@@ -694,15 +695,15 @@ impl<C: RateLimitCache> RateLimitService<C> {
 
     /// The limit, remaining hits and seconds until reset of `status`, under `names`. The reset
     /// re-reads the clock rather than using the status's `duration_until_reset`, as upstream,
-    /// except for an anchored window, whose reset only its state knows.
+    /// except for an anchored window or a token bucket, whose reset only its state knows.
     fn limit_headers(
         &self,
         names: &LimitHeaders,
         (status, limit, descriptor): &(DescriptorStatus, &RateLimit, &RateLimitDescriptor),
     ) -> Result<Vec<HeaderValue>, ServiceError> {
         let reset = match &limit.window {
-            // Only its state knows when an anchored window ends.
-            Some(Window::Anchored(_)) => status
+            // Only its state knows when an anchored window ends, or a token bucket fills.
+            Some(Window::Anchored(_) | Window::TokenBucket(_)) => status
                 .duration_until_reset
                 .as_ref()
                 .map_or(0, |d| d.seconds),

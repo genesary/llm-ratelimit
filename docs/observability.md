@@ -53,6 +53,7 @@ All of them count **hits**, not requests. A request counts 1 hit unless it sends
 | `over_limit_with_local_cache` | Hits the [local cache](backends.md) refused without asking the backend. |
 | `shadow_mode` | Over-limit hits let through because the descriptor has `shadow_mode: true`. |
 | `total_negative_hits` | Hits given back by refunds (`is_negative_hits`). |
+| `total_capped_hits` | Only for `token_bucket` windows: hits past `max_debt`, truncated rather than charged. |
 | `slots_acquired`, `slots_released`, `slots_expired`, `releases_without_slot` | Only for `concurrency` windows. See [below](#concurrency-windows). |
 | `opened_without_hits` | Only for `anchored` windows: sessions that a denied request opened without counting hits in them. See [configuration.md](configuration.md#anchored). |
 
@@ -284,6 +285,8 @@ Each stat goes through a statsd_exporter mapper, which turns its name into a Pro
 | `ratelimit_service_rate_limit_over_limit` | same | `over_limit` |
 | `ratelimit_service_rate_limit_shadow_mode` | same | `shadow_mode` |
 | `ratelimit_service_rate_limit_opened_without_hits` | same | `opened_without_hits` (list limits) |
+| `ratelimit_service_rate_limit_total_capped_hits` | same | `total_capped_hits` |
+| `ratelimit_service_config_lasting_lockouts` | | Limits in `quota_mode` with `max_debt: unlimited`; absent if there are none |
 | `ratelimit_service_rate_limit_slots_acquired`, `…_slots_released`, `…_slots_expired`, `…_releases_without_slot` | same | The [`concurrency`](#concurrency-windows) counters |
 | `ratelimit_service_should_rate_limit_error` | `err_type` (`redis_error`, `service_error`) | `call.should_rate_limit.*` |
 | `ratelimit_service_total_requests` | `grpc_method` | `ratelimit_server.<method>.total_requests` |

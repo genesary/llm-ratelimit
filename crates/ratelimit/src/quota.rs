@@ -28,12 +28,19 @@ pub fn render(lookup: &QuotaLookup) -> String {
 
 /// A limit's entry: its window, its figures, when it resets.
 fn limit_entry(limit: &RateLimit, reading: &LimitReading, now: i64) -> Value {
-    let requests = u64::from(limit.limit.requests_per_unit);
+    // A token bucket's figures are of its capacity.
+    let requests = match &limit.window {
+        Some(Window::TokenBucket(w)) => w.capacity(limit.limit.requests_per_unit),
+        _ => u64::from(limit.limit.requests_per_unit),
+    };
     let window = match &limit.window {
         Some(Window::Fixed(w)) => json!({"type": "fixed", "duration_s": w.duration}),
         Some(Window::Anchored(w)) => json!({"type": "anchored", "duration_s": w.duration}),
         Some(Window::Concurrency(w)) => {
             json!({"type": "concurrency", "lease_s": w.lease, "retry_after_s": w.retry_after})
+        }
+        Some(Window::TokenBucket(w)) => {
+            json!({"type": "token_bucket", "duration_s": w.duration, "burst": requests})
         }
         None => json!({"type": "unit", "unit": limit.limit.unit().as_str_name()}),
     };
@@ -54,6 +61,9 @@ fn limit_entry(limit: &RateLimit, reading: &LimitReading, now: i64) -> Value {
     }
     if let Some(Window::Concurrency(_)) = &limit.window {
         entry["in_flight"] = json!(reading.used);
+    }
+    if let Some(Window::TokenBucket(_)) = &limit.window {
+        entry["level"] = json!(requests as i64 - reading.used as i64);
     }
     entry
 }

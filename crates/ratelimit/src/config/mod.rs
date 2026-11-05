@@ -11,7 +11,10 @@ use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescript
 use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response;
 use schema::YamlDescriptor;
 use std::collections::{HashMap, HashSet};
-use window::{AnchoredWindow, ConcurrencyWindow, FixedWindow, OpenOn, Origin, Window};
+use window::{
+    AnchoredWindow, ConcurrencyWindow, FixedWindow, MaxDebt, OpenOn, Origin, TokenBucketWindow,
+    Window,
+};
 
 /// A config file to load: its name (used in error messages) and its YAML content.
 #[derive(Debug, Clone)]
@@ -31,6 +34,8 @@ pub struct LoadOptions {
     pub memcached: bool,
     /// `CACHE_KEY_PREFIX`, part of the keys whose length is warned about on Memcached.
     pub cache_key_prefix: String,
+    /// `QUOTA_MODE`: every descriptor counts as `quota_mode` for what is warned about (D19).
+    pub global_quota_mode: bool,
 }
 
 /// What a list key may take on Memcached without its window's start and the request's values,
@@ -124,6 +129,7 @@ struct Descriptor {
 pub struct RateLimitConfig {
     domains: HashMap<String, Descriptor>,
     sanitize_dots: bool,
+    global_quota_mode: bool,
 }
 
 /// Loads and validates config files, failing on the first invalid one.
@@ -181,6 +187,7 @@ fn load_roots(
     let mut config = RateLimitConfig {
         domains: HashMap::new(),
         sanitize_dots: options.sanitize_descriptor_metric_dots,
+        global_quota_mode: options.global_quota_mode,
     };
     for (name, root) in names.iter().zip(roots) {
         if root.domain.is_empty() {
@@ -299,7 +306,8 @@ fn load_window(file: &str, at: &str, window: &schema::YamlWindow) -> Result<Wind
         "anchored" => true,
         "concurrency" => return load_concurrency(window, &error).map(Window::Concurrency),
         "" => return Err(error("window type is required".into())),
-        "sliding" | "sliding_approx" | "token_bucket" => {
+        "token_bucket" => false,
+        "sliding" | "sliding_approx" => {
             return Err(error(format!(
                 "window type '{}' is not supported yet",
                 window.kind
@@ -321,6 +329,14 @@ fn load_window(file: &str, at: &str, window: &schema::YamlWindow) -> Result<Wind
             .filter(|d| *d > 0)
             .ok_or_else(|| error(format!("invalid window duration '{text}'")))?,
     };
+    if window.kind == "token_bucket" {
+        return load_token_bucket(window, duration, &error).map(Window::TokenBucket);
+    }
+    for (key, value) in [("burst", &window.burst), ("max_debt", &window.max_debt)] {
+        if !value.is_empty() {
+            return Err(error(format!("{key} is for token_bucket windows")));
+        }
+    }
     if anchored {
         return load_anchored(window, duration, &error).map(Window::Anchored);
     }
@@ -380,6 +396,45 @@ fn load_window(file: &str, at: &str, window: &schema::YamlWindow) -> Result<Wind
         }
     };
     Ok(Window::Fixed(FixedWindow { duration, origin }))
+}
+
+/// A `token_bucket` window's `burst` and `max_debt` (D11).
+fn load_token_bucket(
+    window: &schema::YamlWindow,
+    duration: i64,
+    error: &impl Fn(String) -> ConfigError,
+) -> Result<TokenBucketWindow, ConfigError> {
+    for (key, value) in [
+        ("offset", &window.offset),
+        ("offset_rounding", &window.offset_rounding),
+        ("start_rounding", &window.start_rounding),
+        ("open_on", &window.open_on),
+    ] {
+        if !value.is_empty() {
+            return Err(error(format!("{key} is not for token_bucket windows")));
+        }
+    }
+    let burst = match window.burst.as_str() {
+        "" => None,
+        text => match text.parse::<u64>() {
+            Ok(burst) if burst > 0 => Some(burst),
+            _ => return Err(error(format!("invalid burst '{text}'"))),
+        },
+    };
+    let max_debt = match window.max_debt.as_str() {
+        "" => None,
+        "unlimited" => Some(MaxDebt::Unlimited),
+        text => match (text.parse::<u64>(), window::parse_duration(text)) {
+            (Ok(tokens), _) => Some(MaxDebt::Tokens(tokens)),
+            (_, Some(seconds)) => Some(MaxDebt::Seconds(seconds)),
+            _ => return Err(error(format!("invalid max_debt '{text}'"))),
+        },
+    };
+    Ok(TokenBucketWindow {
+        duration,
+        burst,
+        max_debt,
+    })
 }
 
 /// A `concurrency` window's `lease` and `retry_after` (D35).
@@ -551,6 +606,13 @@ fn load_list(
                 "{file}: {at}: its key takes {static_bytes} bytes before its window's start and the request's values: memcached refuses a key over 250 bytes, which then counts nothing"
             ));
         }
+        if let Window::TokenBucket(bucket) = &window {
+            if entry.requests_per_unit == 0 {
+                return Err(error("a token_bucket needs requests_per_unit above 0"));
+            }
+            let quota_mode = config.quota_mode || options.global_quota_mode;
+            warn_of_token_bucket(file, &at, bucket, entry.requests_per_unit, quota_mode);
+        }
         crate::debug!("Creating stats for key: '{at}'");
         let (unit, multiplier) = window.unit();
         let mut limit = RateLimit {
@@ -573,7 +635,49 @@ fn load_list(
     Ok(limits)
 }
 
+/// What a token bucket's settings may not do well: a bucket lasting a day or more (D11), and
+/// a quota group blocked as long as traffic exceeds the rate (D19).
+fn warn_of_token_bucket(
+    file: &str,
+    at: &str,
+    bucket: &TokenBucketWindow,
+    requests_per_unit: u32,
+    quota_mode: bool,
+) {
+    let refill = u128::from(bucket.capacity(requests_per_unit)) * bucket.duration as u128;
+    if refill >= 86_400 * u128::from(requests_per_unit) {
+        crate::log::warn(&format!(
+            "{file}: {at}: this token_bucket takes a day or more to fill: it does not suit a daily or weekly budget, use a fixed window with an offset"
+        ));
+    }
+    if quota_mode && bucket.max_debt == Some(MaxDebt::Unlimited) {
+        crate::log::warn(&format!(
+            "{file}: {at}: quota_mode with max_debt: unlimited can block a quota group as long as traffic exceeds the rate"
+        ));
+    }
+}
+
 impl Descriptor {
+    /// Its limits, and those under it, in `quota_mode` with `max_debt: unlimited` (D19).
+    fn lasting_lockouts(&self, global_quota_mode: bool) -> u64 {
+        let own = self.list.iter().filter(|limit| {
+            (limit.quota_mode || global_quota_mode)
+                && matches!(
+                    limit.window,
+                    Some(Window::TokenBucket(TokenBucketWindow {
+                        max_debt: Some(MaxDebt::Unlimited),
+                        ..
+                    }))
+                )
+        });
+        own.count() as u64
+            + self
+                .descriptors
+                .values()
+                .map(|descriptor| descriptor.lasting_lockouts(global_quota_mode))
+                .sum::<u64>()
+    }
+
     fn load_descriptors(
         &mut self,
         file: &str,
@@ -650,6 +754,14 @@ impl Descriptor {
 }
 
 impl RateLimitConfig {
+    /// The limits that can block a quota group for as long as traffic lasts (D19).
+    pub fn lasting_lockouts(&self) -> u64 {
+        self.domains
+            .values()
+            .map(|domain| domain.lasting_lockouts(self.global_quota_mode))
+            .sum()
+    }
+
     /// Whether `domain` is configured.
     pub fn has_domain(&self, domain: &str) -> bool {
         self.domains.contains_key(domain)

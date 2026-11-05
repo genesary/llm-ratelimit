@@ -3,8 +3,8 @@
 //! Counting them is in `differential.rs` (which runs a Redis), next to upstream's limits.
 
 use ratelimit::config::window::{
-    Anchored, AnchoredOp, AnchoredResult, AnchoredWindow, ConcurrencyWindow, FixedWindow, OpenOn,
-    Origin, SlotOp, SlotResult, Window,
+    Anchored, AnchoredOp, AnchoredResult, AnchoredWindow, BucketOp, ConcurrencyWindow, FixedWindow,
+    MAX_TAT, MaxDebt, OpenOn, Origin, SlotOp, SlotResult, TokenBucketWindow, Window,
 };
 use ratelimit::config::{self, ConfigFile, LimitLookup, LoadOptions, RateLimit};
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
@@ -689,6 +689,140 @@ fn slots_step_as_d35_says() {
         window.step(&mut slots, SlotOp::Remove(1300), 1301),
         result(false, 0, 0, 0)
     );
+}
+
+/// A `token_bucket` window takes `burst` and `max_debt`, tokens or a duration, `0` and `unlimited`
+/// included (D11); its shape leaves them out (ADR 0001).
+#[test]
+fn token_buckets_load_as_d11_says() {
+    let window = |w: &str| {
+        list(&with_window(w), &[("user", "alice")])[0]
+            .window
+            .unwrap()
+    };
+    assert_eq!(
+        window("{type: token_bucket, duration: 1m}"),
+        Window::TokenBucket(TokenBucketWindow {
+            duration: 60,
+            burst: None,
+            max_debt: None
+        })
+    );
+    assert_eq!(window("{type: token_bucket, duration: 1m}").shape(), "tb60");
+    for (debt, expected) in [
+        ("0", MaxDebt::Tokens(0)),
+        ("500", MaxDebt::Tokens(500)),
+        ("10m", MaxDebt::Seconds(600)),
+        ("unlimited", MaxDebt::Unlimited),
+    ] {
+        assert_eq!(
+            window(&format!(
+                "{{type: token_bucket, duration: 1m, burst: 9, max_debt: {debt}}}"
+            )),
+            Window::TokenBucket(TokenBucketWindow {
+                duration: 60,
+                burst: Some(9),
+                max_debt: Some(expected)
+            })
+        );
+    }
+    let refused = |w: &str| load(&with_window(w)).err();
+    let error = |message: &str| Some(format!("config.yaml: d.user~w: {message}"));
+    for (w, message) in [
+        ("{type: token_bucket}", "window duration is required"),
+        (
+            "{type: token_bucket, duration: 1m, burst: 0}",
+            "invalid burst '0'",
+        ),
+        (
+            "{type: token_bucket, duration: 1m, burst: lots}",
+            "invalid burst 'lots'",
+        ),
+        (
+            "{type: token_bucket, duration: 1m, max_debt: some}",
+            "invalid max_debt 'some'",
+        ),
+        (
+            "{type: token_bucket, duration: 1m, offset: 1s}",
+            "offset is not for token_bucket windows",
+        ),
+        (
+            "{type: fixed, duration: 1m, burst: 1}",
+            "burst is for token_bucket windows",
+        ),
+        (
+            "{type: anchored, duration: 1m, max_debt: 1}",
+            "max_debt is for token_bucket windows",
+        ),
+    ] {
+        assert_eq!(refused(w), error(message), "{w}");
+    }
+    let empty = with_window("{type: token_bucket, duration: 1m}")
+        .replace("requests_per_unit: 1", "requests_per_unit: 0");
+    assert_eq!(
+        load(&empty).err(),
+        error("a token_bucket needs requests_per_unit above 0")
+    );
+    let file = ConfigFile {
+        name: "config.yaml".into(),
+        content: with_window("{type: token_bucket, duration: 1m}"),
+    };
+    let memcached = LoadOptions {
+        memcached: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        config::load(&[file], &memcached)
+            .err()
+            .map(|e| e.to_string()),
+        error("only fixed windows can be counted on Memcached")
+    );
+}
+
+/// The deadline moves by what is charged, stopping at `max_debt`, never back on a charge; a
+/// refund moves it back to now at most.
+#[test]
+fn token_buckets_step_as_d11_says() {
+    let window = TokenBucketWindow {
+        duration: 60,
+        burst: Some(10),
+        max_debt: Some(MaxDebt::Tokens(5)),
+    };
+    let op = |now, hits, refund| BucketOp { now, hits, refund };
+    let at = |seconds: f64| seconds * 1e6;
+    let r = window.step(None, op(1000, 4, false), 60);
+    assert_eq!((r.before, r.after, r.capped), (at(1000.0), at(1004.0), 0));
+    assert_eq!(window.remaining(r.after, 1000, 60), 6);
+    assert!(window.admits(r.after, 1000, 60));
+    // 15 s from now is the most: 10 of capacity and 5 of debt.
+    let r = window.step(Some(r.after), op(1000, 100, false), 60);
+    assert_eq!((r.after, r.capped), (at(1015.0), 89));
+    assert_eq!(window.level(r.after, 1000, 60), -5.0);
+    assert!(!window.admits(r.after, 1000, 60));
+    assert_eq!(window.until_full(r.after, 1000), 15);
+    assert_eq!(window.until_admitted(r.after, 1000, 60), 6);
+    // Fewer tokens of debt now allowed than it is in: a charge does not move it back.
+    let lower = TokenBucketWindow {
+        max_debt: Some(MaxDebt::Tokens(0)),
+        ..window
+    };
+    let r = lower.step(Some(r.after), op(1000, 1, false), 60);
+    assert_eq!((r.after, r.capped), (at(1015.0), 1));
+    let r = window.step(Some(r.after), op(1000, 7, true), 60);
+    assert_eq!(r.after, at(1008.0));
+    let r = window.step(Some(r.after), op(1000, 100, true), 60);
+    assert_eq!(r.after, at(1000.0));
+    // A deadline in the past is a full bucket.
+    let r = window.step(Some(at(500.0)), op(1000, 0, false), 60);
+    assert_eq!((r.before, r.after), (at(1000.0), at(1000.0)));
+    assert_eq!(window.remaining(r.after, 1000, 60), 10);
+    // Without a limit, it stops where a double stops being exact.
+    let free = TokenBucketWindow {
+        max_debt: Some(MaxDebt::Unlimited),
+        ..window
+    };
+    let r = free.step(None, op(1000, u64::MAX, false), 1);
+    assert_eq!(r.after, MAX_TAT);
 }
 
 /// D9's opening and counting, in `envoy` mode: what [`AnchoredWindow::step`] does to a state.
