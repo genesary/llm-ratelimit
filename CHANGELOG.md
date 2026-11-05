@@ -13,6 +13,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - A client-sent `limit`'s `unit_multiplier` is now applied, where it was ignored: one fixed window of that many units. A multiplier of 0, or a window over 2^32 − 1 seconds, is refused.
 
+### Fixed
+
+- On Memcached, a window ending after January 2038 was expired on arrival and never counted: its expiration wrapped its 32 bits. It now stops at their largest value.
+
 ## [0.1.0] - 2026-10-30
 
 The first release.
