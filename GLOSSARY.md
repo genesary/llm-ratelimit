@@ -1,4 +1,4 @@
-# ratelimit
+# llm-ratelimit
 
 A Rust rewrite of envoyproxy/ratelimit: a global rate limit service that Envoy, Envoy Gateway or agentgateway asks whether a request may proceed, extended with several windows per descriptor for LLM quotas.
 

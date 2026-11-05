@@ -89,7 +89,7 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           load: true
-          tags: ratelimit:ci
+          tags: llm-ratelimit:ci
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -98,8 +98,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Test the image against upstream's
         env:
-          RATELIMIT_IMAGE: ratelimit:ci
-        run: cargo test -p ratelimit --test image
+          RATELIMIT_IMAGE: llm-ratelimit:ci
+        run: cargo test -p llm-ratelimit --test image
 
   envoy-gateway:
     name: envoy-gateway
@@ -117,7 +117,7 @@ jobs:
           platforms: linux/amd64
           load: true
           # Envoy Gateway's chart reads REGISTRY/REPOSITORY:TAG.
-          tags: localhost/ratelimit:ci
+          tags: localhost/llm-ratelimit:ci
           cache-from: type=gha,scope=linux/amd64
       - name: Install kind
         run: |
@@ -125,4 +125,4 @@ jobs:
           echo "${KIND_SHA256}  kind" | sha256sum --check
           sudo install kind /usr/local/bin/kind
       - name: Envoy Gateway with our image, against upstream's
-        run: tools/envoy-gateway/test.sh localhost/ratelimit:ci
+        run: tools/envoy-gateway/test.sh localhost/llm-ratelimit:ci

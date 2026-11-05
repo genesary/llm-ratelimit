@@ -356,7 +356,7 @@ runtime_load_attempts 1
 - **A file that cannot be read, or is not a valid mapping, is ignored silently.** No stat is then mapped; the shipped mapper is not used instead. Check a new file by scraping once.
 - **The shipped mapper's rules do not match tagged names.** With `EXTRA_TAGS` set, every stat is unmapped, and timers become summaries. Avoid `EXTRA_TAGS` with Prometheus; use the scrape's own labels (target, pod) instead.
 
-The shipped mapper is the file [`default_mapper.yaml`](../crates/ratelimit/src/stats/prometheus/default_mapper.yaml): copy it as a starting point for your own.
+The shipped mapper is the file [`default_mapper.yaml`](../crates/llm-ratelimit/src/stats/prometheus/default_mapper.yaml): copy it as a starting point for your own.
 
 ### stderr: the logging sink
 

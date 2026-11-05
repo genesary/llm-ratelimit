@@ -1,9 +1,11 @@
-# ratelimit
+# llm-ratelimit
 
-[![CI](https://github.com/genesary/ratelimit/actions/workflows/ci.yml/badge.svg)](https://github.com/genesary/ratelimit/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/genesary/ratelimit?sort=semver)](https://github.com/genesary/ratelimit/releases)
+Drop-in replacement for envoyproxy/ratelimit, built for LLM gateways: token quotas, sessions, concurrency.
+
+[![CI](https://github.com/genesary/llm-ratelimit/actions/workflows/ci.yml/badge.svg)](https://github.com/genesary/llm-ratelimit/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/genesary/llm-ratelimit?sort=semver)](https://github.com/genesary/llm-ratelimit/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/genesary/ratelimit/badge)](https://scorecard.dev/viewer/?uri=github.com/genesary/ratelimit)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/genesary/llm-ratelimit/badge)](https://scorecard.dev/viewer/?uri=github.com/genesary/llm-ratelimit)
 [![MSRV](https://img.shields.io/badge/rust-1.99-orange)](#building-and-testing)
 
 A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit), compatible with it at commit [`f4e7669`](https://github.com/envoyproxy/ratelimit/commit/f4e7669), and extended with several windows per descriptor for LLM quotas.
@@ -20,7 +22,7 @@ To replace envoy ratelimit behind Envoy, Envoy Gateway or agentgateway, you only
 ### Why not
 
 - It is young (v0.1.0) and has a single maintainer. The upstream project has years of production use.
-- `sliding` and `token_bucket` windows and `overflow: strict` are designed but not built yet, and are refused at load.
+- `sliding` windows and `overflow: strict` are designed but not built yet, and are refused at load.
 - Where this service differs on purpose (where upstream panics, an error at startup or on the request; a stricter TLS check; …), the difference is listed in [`docs/parity.md`](docs/parity.md) §7.
 
 ## Quick start
@@ -48,7 +50,7 @@ docker run -d --name ratelimit --network rl -p 8080:8080 -p 8081:8081 \
   -v "$PWD/runtime:/srv/runtime_data/current:ro" \
   -e RUNTIME_SUBDIRECTORY=ratelimit -e RUNTIME_WATCH_ROOT=false -e USE_STATSD=false \
   -e REDIS_SOCKET_TYPE=tcp -e REDIS_URL=redis:6379 \
-  ghcr.io/genesary/ratelimit:0.1.0
+  ghcr.io/genesary/llm-ratelimit:0.2.0
 ```
 
 gRPC (`envoy.service.ratelimit.v3.RateLimitService`) listens on 8081, and HTTP on 8080. A decision counting 1200 tokens:
@@ -74,7 +76,7 @@ curl -s localhost:8080/quota -d '{"domain":"llm","descriptors":[{"entries":[{"ke
 
 ## Migrating from envoyproxy/ratelimit
 
-Swap the image for `ghcr.io/genesary/ratelimit` and keep your configuration and environment variables. The binary is at `/bin/ratelimit`, as upstream's is. Upstream configurations load and count exactly as before. The extensions are opt-in, through `rate_limits:` lists.
+Swap the image for `ghcr.io/genesary/llm-ratelimit` and keep your configuration and environment variables. The binary is at `/bin/ratelimit`, as upstream's is. Upstream configurations load and count exactly as before. The extensions are opt-in, through `rate_limits:` lists.
 
 ## Features
 
@@ -107,11 +109,11 @@ The full documentation is in [`docs/`](docs/README.md):
 
 ## Releases and verification
 
-Images are published as `ghcr.io/genesary/ratelimit:<version>` for linux/amd64 and linux/arm64, with an SBOM and provenance, signed with cosign (keyless):
+Images are published as `ghcr.io/genesary/llm-ratelimit:<version>` for linux/amd64 and linux/arm64, with an SBOM and provenance, signed with cosign (keyless):
 
 ```sh
-cosign verify ghcr.io/genesary/ratelimit:0.1.0 \
-  --certificate-identity https://github.com/genesary/ratelimit/.github/workflows/release.yml@refs/tags/v0.1.0 \
+cosign verify ghcr.io/genesary/llm-ratelimit:0.2.0 \
+  --certificate-identity https://github.com/genesary/llm-ratelimit/.github/workflows/release.yml@refs/tags/v0.2.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
@@ -122,8 +124,8 @@ Versions follow [Semantic Versioning](https://semver.org/). Before 1.0, a minor 
 The supported Rust version is 1.99 (`rust-version` in `Cargo.toml`), which is what CI builds with.
 
 ```sh
-cargo build --release -p ratelimit       # target/release/ratelimit
-docker build -t ratelimit .               # the image: /bin/ratelimit on distroless
+cargo build --release -p llm-ratelimit   # target/release/llm-ratelimit
+docker build -t llm-ratelimit .           # the image: /bin/llm-ratelimit on distroless
 ```
 
 The differential tests build upstream's service from [`tools/oracle`](tools/oracle) and need `go`, `redis-server` and `memcached` on the `PATH`. Without them, those tests are skipped:
@@ -141,4 +143,4 @@ RATELIMIT_REDIS_SERVER=/path/to/valkey-server cargo test --workspace   # against
 
 ## License
 
-[Apache-2.0](LICENSE). [`NOTICE`](NOTICE) credits envoyproxy/ratelimit, the Envoy API and the other projects this one ports. The image ships both files, with the licenses of the crates the binary is built from, in `/usr/share/doc/ratelimit/`.
+[Apache-2.0](LICENSE). [`NOTICE`](NOTICE) credits envoyproxy/ratelimit, the Envoy API and the other projects this one ports. The image ships both files, with the licenses of the crates the binary is built from, in `/usr/share/doc/llm-ratelimit/`.

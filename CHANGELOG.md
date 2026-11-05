@@ -16,6 +16,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- The project is renamed `llm-ratelimit`: the repository, `genesary/llm-ratelimit`, the image, `ghcr.io/genesary/llm-ratelimit`, and the crates. The image's entrypoint is `/bin/llm-ratelimit`. What makes it a drop-in replacement does not change: the environment variables, the APIs, the Redis and Memcached keys, the stat and metric names, and `/bin/ratelimit`, which stays as a link.
 - A client-sent `limit`'s `unit_multiplier` is now applied, where it was ignored: one fixed window of that many units. A multiplier of 0, or a window over 2^32 − 1 seconds, is refused.
 
 ### Fixed
@@ -46,5 +47,5 @@ The first release.
 - **Redis down:** a decision fails at once while every connection is down, so that callers without a deadline (agentgateway) apply their failure mode; upstream holds decisions until the caller's deadline.
 - **Errors instead of panics:** where upstream panics, this service returns an error, at startup or on the request, and TLS checks are stricter. The full list is in `docs/parity.md` §7.
 
-[Unreleased]: https://github.com/genesary/ratelimit/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/genesary/ratelimit/releases/tag/v0.1.0
+[Unreleased]: https://github.com/genesary/llm-ratelimit/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/genesary/llm-ratelimit/releases/tag/v0.1.0

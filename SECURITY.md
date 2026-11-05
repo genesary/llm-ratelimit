@@ -12,7 +12,7 @@ Only the latest release gets security fixes. Before 1.0, that is the latest `0.x
 
 Do not open a public issue. Report it privately, in one of two ways:
 
-- **GitHub's private vulnerability reporting** (preferred): [open a draft advisory](https://github.com/genesary/ratelimit/security/advisories/new).
+- **GitHub's private vulnerability reporting** (preferred): [open a draft advisory](https://github.com/genesary/llm-ratelimit/security/advisories/new).
 - **Email:** [dev@ayrick.fr](mailto:dev@ayrick.fr).
 
 Include the version or image digest, the configuration and environment needed to reproduce, and the impact you see.
@@ -26,7 +26,7 @@ If the vulnerability is in envoyproxy/ratelimit's own behaviour, which this proj
 
 ## Scope
 
-- **In scope:** the `ratelimit` binary, its container image, and its release pipeline.
+- **In scope:** the `llm-ratelimit` binary, its container image, and its release pipeline.
 - **Out of scope:** Redis, Memcached and the proxies in front of the service are separate projects. Report their vulnerabilities to them, unless this service makes one exploitable.
 
 Dependencies are checked against RustSec advisories in CI (`cargo deny`) and updated by Dependabot.

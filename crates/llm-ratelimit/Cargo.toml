@@ -1,0 +1,64 @@
+[package]
+name = "llm-ratelimit"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description.workspace = true
+repository.workspace = true
+
+[dependencies]
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-smithy-http-client.workspace = true
+aws-types.workspace = true
+jiff.workspace = true
+base64.workspace = true
+bytes.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
+fred.workspace = true
+futures-util.workspace = true
+hickory-resolver.workspace = true
+getrandom.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyper-rustls.workspace = true
+prost.workspace = true
+pin-project-lite.workspace = true
+prost-types.workspace = true
+llm-ratelimit-proto.workspace = true
+regex.workspace = true
+ring.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+serde_json.workspace = true
+x509-parser.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+xxhash-rust.workspace = true
+yaml-rust2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify.workspace = true
+
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc.workspace = true
+
+[dev-dependencies]
+rcgen = "0.14"
+tonic-prost.workspace = true
+tokio-rustls.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-stream.workspace = true

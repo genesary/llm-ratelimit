@@ -14,25 +14,25 @@ Every variable named here is in [`environment.md`](environment.md); the YAML for
 ## The image
 
 ```text
-ghcr.io/genesary/ratelimit:<version>
+ghcr.io/genesary/llm-ratelimit:<version>
 ```
 
 | | |
 |---|---|
 | **Tags** | Set by the release workflow: the version (`0.1.0`) and its major and minor (`0.1`), each also with a `v` like the git tag (`v0.1.0`, `v0.1`), and `sha-<commit>` |
 | **Platforms** | `linux/amd64`, `linux/arm64` |
-| **Binary** | `/bin/ratelimit`, the entrypoint. It takes no arguments: everything is set by environment variables. |
+| **Binary** | `/bin/llm-ratelimit`, the entrypoint, and `/bin/ratelimit`, a link to it, the path upstream's manifests call. It takes no arguments: everything is set by environment variables. |
 | **Base** | `gcr.io/distroless/static-debian12:nonroot`, as upstream's: no shell, no package manager, no `curl`. |
 | **User** | Runs as any UID. CI runs it as 65534 with a read-only root file system, every capability dropped and `no-new-privileges`. It writes no file. |
 | **Ports** | 8080 HTTP (`/json`, `/quota`, `/healthcheck`), 8081 gRPC, 6070 debug (`/rlconfig`, `/stats`). With `USE_PROMETHEUS=true`, 9090 for `/metrics`. They listen on IPv4 and IPv6 (IPv4 alone where the container has no IPv6). |
 | **Configuration** | Files in `$RUNTIME_ROOT/$RUNTIME_SUBDIRECTORY/config/`. `RUNTIME_ROOT` defaults to `/srv/runtime_data/current`. |
-| **Licenses** | `/usr/share/doc/ratelimit/`: `LICENSE`, `NOTICE`, and `THIRD-PARTY-LICENSES.txt` for the crates the binary is built from. |
+| **Licenses** | `/usr/share/doc/llm-ratelimit/`: `LICENSE`, `NOTICE`, and `THIRD-PARTY-LICENSES.txt` for the crates the binary is built from. |
 
 Without a shell, files are read from outside the container. To read the licenses:
 
 ```sh
-id=$(docker create ghcr.io/genesary/ratelimit:0.1.0)
-docker cp "$id:/usr/share/doc/ratelimit" ./ratelimit-licenses
+id=$(docker create ghcr.io/genesary/llm-ratelimit:0.2.0)
+docker cp "$id:/usr/share/doc/llm-ratelimit" ./llm-ratelimit-licenses
 docker rm "$id"
 ```
 
@@ -41,8 +41,8 @@ docker rm "$id"
 Each release is signed with cosign (keyless, by the release workflow's GitHub identity), and carries an SBOM and a provenance attestation:
 
 ```sh
-cosign verify ghcr.io/genesary/ratelimit:0.1.0 \
-  --certificate-identity https://github.com/genesary/ratelimit/.github/workflows/release.yml@refs/tags/v0.1.0 \
+cosign verify ghcr.io/genesary/llm-ratelimit:0.2.0 \
+  --certificate-identity https://github.com/genesary/llm-ratelimit/.github/workflows/release.yml@refs/tags/v0.2.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
@@ -118,7 +118,7 @@ services:
     command: ["redis-server", "--save", ""]
 
   ratelimit:
-    image: ghcr.io/genesary/ratelimit:0.1.0
+    image: ghcr.io/genesary/llm-ratelimit:0.2.0
     depends_on: [redis]
     user: "65534:65534"
     read_only: true
@@ -193,7 +193,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: ratelimit
-          image: ghcr.io/genesary/ratelimit:0.1.0
+          image: ghcr.io/genesary/llm-ratelimit:0.2.0
           env:
             - {name: RUNTIME_SUBDIRECTORY, value: ratelimit}
             - {name: RUNTIME_WATCH_ROOT, value: "false"}
@@ -268,7 +268,7 @@ The chart values of that test:
 global:
   images:
     ratelimit:
-      image: ghcr.io/genesary/ratelimit:0.1.0
+      image: ghcr.io/genesary/llm-ratelimit:0.2.0
       pullPolicy: IfNotPresent
 config:
   envoyGateway:
@@ -333,7 +333,7 @@ Choose with what an outage costs in mind. For a shared model pool, `failOpen` ke
 
 ## Replacing upstream's image
 
-Change only the image, from `envoyproxy/ratelimit:<tag>` to `ghcr.io/genesary/ratelimit:<version>`, and keep the variables, the YAML files, the mounts and the probes:
+Change only the image, from `envoyproxy/ratelimit:<tag>` to `ghcr.io/genesary/llm-ratelimit:<version>`, and keep the variables, the YAML files, the mounts and the probes:
 
 - **Counters:** Redis and Memcached keys are the same, so the windows in progress carry over.
 - **Metrics and logs:** stat names, Prometheus series and log lines are the same, except for the differences in [`parity.md`](parity.md) §7. One of them: no `ratelimit.go.*` stats, and no `go_*` or `process_*` Prometheus metrics.

@@ -57,7 +57,7 @@ Each value of `user` gets its own session and its own weekly window ([configurat
 
 ```sh
 RUNTIME_SUBDIRECTORY=ratelimit RUNTIME_WATCH_ROOT=false USE_STATSD=false \
-REDIS_SOCKET_TYPE=tcp REDIS_URL=redis:6379 /bin/ratelimit
+REDIS_SOCKET_TYPE=tcp REDIS_URL=redis:6379 /bin/llm-ratelimit
 ```
 
 To also cap a whole workspace, add a second descriptor (`key: workspace`) with its own `rate_limits:`, and a second descriptor on the agentgateway side. A request is then denied when either one is over.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/ratelimit", "crates/ratelimit-proto"]
+members = ["crates/llm-ratelimit", "crates/llm-ratelimit-proto"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +8,8 @@ edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
 publish = false
+description = "Drop-in replacement for envoyproxy/ratelimit, built for LLM gateways: token quotas, sessions, concurrency."
+repository = "https://github.com/genesary/llm-ratelimit"
 
 [workspace.dependencies]
 aws-config = { version = "1.13", default-features = false, features = ["behavior-version-latest", "credentials-login", "credentials-process", "rt-tokio", "sso"] }
@@ -52,7 +54,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 tokio-stream = { version = "0.1", features = ["net"] }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 yaml-rust2 = "0.13"
-ratelimit-proto = { path = "crates/ratelimit-proto" }
+llm-ratelimit-proto = { path = "crates/llm-ratelimit-proto" }
 
 [profile.release]
 # Symbols left out, as upstream's `-ldflags="-w -s"`.
