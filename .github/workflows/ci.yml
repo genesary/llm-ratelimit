@@ -99,7 +99,7 @@ jobs:
       - name: Test the image against upstream's
         env:
           RATELIMIT_IMAGE: ratelimit:ci
-        run: cargo test -p ratelimit --test image
+        run: cargo test -p llm-ratelimit --test image
 
   envoy-gateway:
     name: envoy-gateway

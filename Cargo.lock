@@ -1832,6 +1832,66 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
+name = "llm-ratelimit"
+version = "0.1.0"
+dependencies = [
+ "aws-config",
+ "aws-credential-types",
+ "aws-smithy-http-client",
+ "aws-types",
+ "base64 0.23.1",
+ "bytes",
+ "crc32fast",
+ "flate2",
+ "fred",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hickory-resolver",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "inotify",
+ "jiff",
+ "llm-ratelimit-proto",
+ "mimalloc",
+ "pin-project-lite",
+ "prost",
+ "prost-types",
+ "rcgen",
+ "regex",
+ "ring",
+ "rustls",
+ "rustls-native-certs",
+ "serde_json",
+ "socket2 0.6.5",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tower",
+ "x509-parser",
+ "xxhash-rust",
+ "yaml-rust2",
+]
+
+[[package]]
+name = "llm-ratelimit-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "protox",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2416,66 +2476,6 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
-
-[[package]]
-name = "ratelimit"
-version = "0.1.0"
-dependencies = [
- "aws-config",
- "aws-credential-types",
- "aws-smithy-http-client",
- "aws-types",
- "base64 0.23.1",
- "bytes",
- "crc32fast",
- "flate2",
- "fred",
- "futures-util",
- "getrandom 0.4.3",
- "hickory-resolver",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "inotify",
- "jiff",
- "mimalloc",
- "pin-project-lite",
- "prost",
- "prost-types",
- "ratelimit-proto",
- "rcgen",
- "regex",
- "ring",
- "rustls",
- "rustls-native-certs",
- "serde_json",
- "socket2 0.6.5",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tower",
- "x509-parser",
- "xxhash-rust",
- "yaml-rust2",
-]
-
-[[package]]
-name = "ratelimit-proto"
-version = "0.1.0"
-dependencies = [
- "prost",
- "prost-types",
- "protox",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
 
 [[package]]
 name = "rcgen"
