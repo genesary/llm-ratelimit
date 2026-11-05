@@ -110,7 +110,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 
 **D14. Counting mode per descriptor** *(amended)*: `overflow: envoy | strict`.
 
-- `envoy` (default, for `rate_limit:` and `rate_limits:`): everything is counted, including denied requests. It is the only mode that never loses agentgateway's token amendments, sent after the response without reading the result, unless the local cache answers for a `fixed` limit (D18).
+- `envoy` (default, for `rate_limit:` and `rate_limits:`): everything is counted, including denied requests. It is the only mode that never loses agentgateway's token amendments, sent after the response without reading the result, unless the local cache answers (D18).
 - `strict`: all-or-nothing over the list. **A descriptor whose list is exhausted is not counted**, and a denied request changes no state (anchor included, D9).
 - 0-hit request: `envoy` uses `>` like the reference, `strict` uses `>=`.
 - To document: in `strict`, a denied agentgateway amendment is lost without a signal; with a `cost` expression, an amendment larger than the remaining tokens is denied and the bucket is not touched, so `strict` + `cost` limits almost nothing.
