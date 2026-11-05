@@ -14381,6 +14381,7 @@ async fn quota_lookups_show_slots_in_flight() {
 /// A service on a Redis Cluster's `nodes`, with its own clock.
 async fn clustered_service(
     nodes: &[Redis],
+    yaml: &str,
 ) -> (Arc<RateLimitService<RedisCache>>, Arc<ManualClock>) {
     let hosts: Vec<String> = nodes[1..]
         .iter()
@@ -14402,7 +14403,7 @@ async fn clustered_service(
     ));
     let file = ConfigFile {
         name: "config.yaml".into(),
-        content: CONCURRENT.into(),
+        content: yaml.into(),
     };
     service.set_config(config::load(&[file], &LoadOptions::default()).unwrap());
     (service, clock)
@@ -14420,9 +14421,9 @@ async fn the_concurrency_script_steps_like_the_rust_window_on_a_cluster() {
     use ratelimit::config::window::{ConcurrencyWindow, SlotOp};
     let cluster = RedisCluster::start().await;
     let instances = [
-        clustered_service(&cluster.nodes).await,
-        clustered_service(&cluster.nodes).await,
-        clustered_service(&cluster.nodes).await,
+        clustered_service(&cluster.nodes, CONCURRENT).await,
+        clustered_service(&cluster.nodes, CONCURRENT).await,
+        clustered_service(&cluster.nodes, CONCURRENT).await,
     ];
     let at = |now: i64| {
         for (_, clock) in &instances {
@@ -14837,6 +14838,732 @@ llm:
     drop(queued);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(slots_held(&redis, &key("queued")).await, "1");
+}
+
+const BUCKET: &str = "
+domain: d
+descriptors:
+  - key: minute
+    rate_limits:
+      - {name: b, requests_per_unit: 60, window: {type: token_bucket, duration: 60s}}
+  - key: small
+    rate_limits:
+      - {name: b, requests_per_unit: 60, window: {type: token_bucket, duration: 60s, burst: 10, max_debt: 0}}
+  - key: free
+    rate_limits:
+      - {name: b, requests_per_unit: 60, window: {type: token_bucket, duration: 60s, max_debt: unlimited}}
+  - key: slow
+    rate_limits:
+      - {name: b, requests_per_unit: 7, window: {type: token_bucket, duration: 1h, burst: 3, max_debt: 10m}}
+  - key: shadow
+    shadow_mode: true
+    rate_limits:
+      - {name: b, requests_per_unit: 60, window: {type: token_bucket, duration: 60s, burst: 1}}
+";
+
+/// A bucket that is not empty admits any request, charged in full, down to `max_debt`, its
+/// default a whole bucket; empty, it denies until it is not. Allowed, the reset is when it is
+/// full; denied, when it admits again (D11, D12). A check takes nothing.
+#[tokio::test]
+async fn token_buckets_admit_until_empty_and_charge_in_full() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(BUCKET, Settings::default()).await;
+    let alice: &[&[(&str, &str)]] = &[&[("minute", "alice")]];
+    h.at(1_000_000_000);
+    // A full bucket has no key to write.
+    assert_eq!(
+        h.statuses(hits(alice, 0)).await,
+        owned([("Ok", "b", 60, 0)])
+    );
+    assert!(h.keys().await.is_empty());
+    assert_eq!(
+        h.statuses(hits(alice, 50)).await,
+        owned([("Ok", "b", 10, 50)])
+    );
+    // 10 tokens left: admitted, in debt by 20.
+    assert_eq!(
+        h.statuses(hits(alice, 30)).await,
+        owned([("Ok", "b", 0, 80)])
+    );
+    assert_eq!(
+        h.statuses(hits(alice, 0)).await,
+        owned([("OverLimit", "b", 0, 21)])
+    );
+    // At 0 tokens it still denies, a second before it admits.
+    h.at(1_000_000_020);
+    assert_eq!(
+        h.statuses(hits(alice, 0)).await,
+        owned([("OverLimit", "b", 0, 1)])
+    );
+    h.at(1_000_000_021);
+    assert_eq!(
+        h.statuses(hits(alice, 0)).await,
+        owned([("Ok", "b", 1, 59)])
+    );
+    // The key is the deadline in microseconds, kept until it is full, and a margin.
+    let keys = h.keys().await;
+    let (value, ttl) = &keys["{d_minute_alice_}_tb60_b"];
+    assert_eq!(value, "1000000080000000");
+    assert_eq!(*ttl, 120);
+    // Past the debt, the rest is truncated: the deadline stops at 2 buckets from now.
+    assert_eq!(
+        h.statuses(hits(alice, 1000)).await,
+        owned([("Ok", "b", 0, 120)])
+    );
+    let stat = "ratelimit.service.rate_limit.d.minute~b.total_capped_hits";
+    assert_eq!(h.stats()[stat], 939);
+    // Denied hits are charged as well, as `overflow: envoy` says, up to the debt.
+    assert_eq!(
+        h.statuses(hits(alice, 5)).await,
+        owned([("OverLimit", "b", 0, 61)])
+    );
+    assert_eq!(h.stats()[stat], 944);
+}
+
+/// `burst` is the capacity, whatever the rate; with `max_debt: 0` it stops at empty; with
+/// `max_debt: unlimited`, nothing is truncated; as a duration, it is what refills in it.
+#[tokio::test]
+async fn token_buckets_follow_their_burst_and_max_debt() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(BUCKET, Settings::default()).await;
+    h.at(1_000_000_000);
+    let small: &[&[(&str, &str)]] = &[&[("small", "a")]];
+    assert_eq!(
+        h.statuses(hits(small, 0)).await,
+        owned([("Ok", "b", 10, 0)])
+    );
+    assert_eq!(
+        h.statuses(hits(small, 25)).await,
+        owned([("Ok", "b", 0, 10)])
+    );
+    assert_eq!(
+        h.statuses(hits(small, 0)).await,
+        owned([("OverLimit", "b", 0, 1)])
+    );
+    let capped = "ratelimit.service.rate_limit.d.small~b.total_capped_hits";
+    assert_eq!(h.stats()[capped], 15);
+
+    let free: &[&[(&str, &str)]] = &[&[("free", "a")]];
+    assert_eq!(
+        h.statuses(hits(free, 1000)).await,
+        owned([("Ok", "b", 0, 1000)])
+    );
+    assert_eq!(
+        h.statuses(hits(free, 0)).await,
+        owned([("OverLimit", "b", 0, 941)])
+    );
+
+    // 7 tokens an hour, whose 10 min of debt are 1.17 tokens, on a capacity of 3.
+    let slow: &[&[(&str, &str)]] = &[&[("slow", "a")]];
+    h.call(hits(slow, 100)).await;
+    let keys = h.keys().await;
+    let limit = (3.0 + 600.0 * 7.0 / 3600.0) * (3600.0 * 1e6 / 7.0);
+    let expected = (1e15_f64 + limit).ceil();
+    assert_eq!(keys["{d_slow_a_}_tb3600_b"].0, format!("{expected:.0}"));
+}
+
+/// A refund moves the deadline back, never before now, and is always OK, whatever it finds
+/// (D21). Back at full, the key is gone.
+#[tokio::test]
+async fn refunds_move_a_token_buckets_deadline_back() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(BUCKET, Settings::default()).await;
+    let alice: &[&[(&str, &str)]] = &[&[("minute", "alice")]];
+    let refund = |n: u64| {
+        let mut request = hits(alice, n);
+        request.descriptors[0].is_negative_hits = true;
+        request
+    };
+    h.at(1_000_000_000);
+    h.call(hits(alice, 90)).await;
+    assert_eq!(
+        h.statuses(hits(alice, 0)).await,
+        owned([("OverLimit", "b", 0, 31)])
+    );
+    assert_eq!(h.statuses(refund(40)).await, owned([("Ok", "b", 10, 50)]));
+    assert_eq!(
+        h.statuses(hits(alice, 0)).await,
+        owned([("Ok", "b", 10, 50)])
+    );
+    assert_eq!(h.statuses(refund(500)).await, owned([("Ok", "b", 60, 0)]));
+    assert!(h.keys().await.is_empty());
+    assert_eq!(
+        h.subject
+            .stats
+            .snapshot()
+            .get("ratelimit.service.rate_limit.d.minute~b.total_negative_hits"),
+        Some(&540)
+    );
+}
+
+/// `within_limit` is what is admitted; `near_limit` and `over_limit` split usage as the legacy
+/// does, usage being capacity minus what remains (D22).
+#[tokio::test]
+async fn token_bucket_stats_count_as_d22_says() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(BUCKET, Settings::default()).await;
+    let alice: &[&[(&str, &str)]] = &[&[("minute", "alice")]];
+    h.at(1_000_000_000);
+    h.call(hits(alice, 40)).await;
+    // 80 % of 60 is 48: 40 to 50 goes 2 past it.
+    h.call(hits(alice, 10)).await;
+    h.call(hits(alice, 20)).await;
+    h.call(hits(alice, 20)).await;
+    let snapshot = h.subject.stats.snapshot();
+    let stat = |name: &str| {
+        snapshot
+            .get(&format!("ratelimit.service.rate_limit.d.minute~b.{name}"))
+            .copied()
+    };
+    assert_eq!(stat("total_hits"), Some(90));
+    assert_eq!(stat("within_limit"), Some(70));
+    // 60 is the capacity: the third goes 10 past it, and 10 near it, as the legacy splits them.
+    assert_eq!(stat("near_limit"), Some(12));
+    assert_eq!(stat("over_limit"), Some(30));
+    // In shadow mode, what is over counts there too: of 3, 1 fits, 1 goes over, 1 is truncated.
+    let shadow: &[&[(&str, &str)]] = &[&[("shadow", "a")]];
+    h.call(hits(shadow, 3)).await;
+    assert_eq!(
+        h.subject
+            .stats
+            .snapshot()
+            .get("ratelimit.service.rate_limit.d.shadow~b.shadow_mode"),
+        Some(&1)
+    );
+}
+
+/// A bucket is charged whatever `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` does to the request's
+/// other keys (D20).
+#[tokio::test]
+async fn stopping_increments_leaves_token_buckets_alone() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        cache: CacheSettings {
+            stop_cache_key_increment_when_overlimit: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let yaml = "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: b, requests_per_unit: 60, window: {type: token_bucket, duration: 60s}}
+  - key: org
+    rate_limit: {unit: hour, requests_per_unit: 1}
+";
+    let h = Extended::start(yaml, settings).await;
+    h.at(1_000_000_000);
+    // From the second request on, `org` is about to go over.
+    for _ in 0..3 {
+        h.call(request("d", &[&[("user", "a")], &[("org", "x")]]))
+            .await;
+    }
+    assert_eq!(h.keys().await["{d_user_a_}_tb60_b"].0, "1000000003000000");
+}
+
+/// What the script stores and truncates is what [`TokenBucketWindow::step`] says, huge hits
+/// included, up to where a double stops being exact.
+#[tokio::test]
+async fn the_token_bucket_script_stores_what_the_rust_window_says() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit::config::window::{BucketOp, MaxDebt, TokenBucketWindow};
+    let h = Extended::start(BUCKET, Settings::default()).await;
+    let buckets = [
+        (
+            "small",
+            60,
+            TokenBucketWindow {
+                duration: 60,
+                burst: Some(10),
+                max_debt: Some(MaxDebt::Tokens(0)),
+            },
+        ),
+        (
+            "slow",
+            7,
+            TokenBucketWindow {
+                duration: 3600,
+                burst: Some(3),
+                max_debt: Some(MaxDebt::Seconds(600)),
+            },
+        ),
+        (
+            "free",
+            60,
+            TokenBucketWindow {
+                duration: 60,
+                burst: None,
+                max_debt: Some(MaxDebt::Unlimited),
+            },
+        ),
+    ];
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    for (key, requests, window) in buckets {
+        let shape = window.duration;
+        let stored_key = format!("{{d_{key}_k_}}_tb{shape}_b");
+        let mut tat: Option<f64> = None;
+        let mut now: i64 = 1_000_000_000;
+        let mut capped: u64 = 0;
+        for step in 0..120 {
+            now += next(500) as i64;
+            h.at(now);
+            let op = BucketOp {
+                now,
+                hits: match next(5) {
+                    0 => u64::MAX,
+                    1 => next(1 << 40),
+                    _ => next(300),
+                },
+                refund: next(6) == 0,
+            };
+            let expected = window.step(tat, op, requests);
+            if expected.after != expected.before {
+                tat = (expected.after > now as f64 * 1e6).then_some(expected.after);
+            }
+            // Counters wrap, as gostats' do.
+            capped = capped.wrapping_add(expected.capped);
+            let mut request = hits(&[&[(key, "k")]], op.hits);
+            request.descriptors[0].is_negative_hits = op.refund;
+            h.call(request).await;
+            let reply = resp_command(&h.redis.address, &["GET", &stored_key]).await;
+            let stored: Option<f64> = reply.lines().nth(1).map(|v| v.parse().unwrap());
+            assert_eq!(stored, tat, "{key} step {step} at {now}: {op:?}");
+        }
+        let counted = h
+            .subject
+            .stats
+            .snapshot()
+            .get(&format!(
+                "ratelimit.service.rate_limit.d.{key}~b.total_capped_hits"
+            ))
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(counted, capped, "{key}");
+    }
+}
+
+/// A denied bucket is kept in the local cache until it would admit, a refund clearing it; never
+/// in shadow mode, its own or global (D18).
+#[tokio::test]
+async fn denied_token_buckets_are_kept_in_the_local_cache() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        cache: CacheSettings {
+            local_cache_size_in_bytes: 1 << 20,
+            stop_cache_key_increment_when_overlimit: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(BUCKET, settings).await;
+    let alice: &[&[(&str, &str)]] = &[&[("minute", "alice")]];
+    let scripts = async || {
+        let commands = h.redis.commands().await;
+        commands.iter().filter(|c| c.contains("EVAL")).count()
+    };
+    h.at(1_000_000_000);
+    h.call(hits(alice, 90)).await;
+    // Denied, then answered from the entry, with what it has left.
+    assert_eq!(
+        h.statuses(hits(alice, 0)).await,
+        owned([("OverLimit", "b", 0, 31)])
+    );
+    let before = scripts().await;
+    h.at(1_000_000_010);
+    assert_eq!(
+        h.statuses(hits(alice, 0)).await,
+        owned([("OverLimit", "b", 0, 21)])
+    );
+    assert_eq!(scripts().await, before);
+    // Its entry ends when the bucket admits.
+    h.at(1_000_000_031);
+    assert_eq!(
+        h.statuses(hits(alice, 0)).await,
+        owned([("Ok", "b", 1, 59)])
+    );
+    assert!(scripts().await > before);
+    // A refund clears it at once.
+    h.call(hits(alice, 100)).await;
+    h.call(hits(alice, 0)).await;
+    let mut refund = hits(alice, 100);
+    refund.descriptors[0].is_negative_hits = true;
+    h.call(refund).await;
+    assert_eq!(h.call(hits(alice, 0)).await.overall_code(), Code::Ok);
+    // In shadow mode, nothing is cached.
+    let shadow: &[&[(&str, &str)]] = &[&[("shadow", "a")]];
+    h.call(hits(shadow, 2)).await;
+    assert_eq!(h.call(hits(shadow, 0)).await.overall_code(), Code::Ok);
+    let before = scripts().await;
+    assert_eq!(h.call(hits(shadow, 0)).await.overall_code(), Code::Ok);
+    assert!(scripts().await > before);
+
+    let settings = Settings {
+        cache: CacheSettings {
+            local_cache_size_in_bytes: 1 << 20,
+            global_shadow_mode: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(BUCKET, settings).await;
+    h.at(1_000_000_000);
+    h.call(hits(alice, 90)).await;
+    // Denied, were it not for global shadow mode: the next amendment still counts.
+    h.call(hits(alice, 0)).await;
+    h.call(hits(alice, 5)).await;
+    assert_eq!(
+        h.keys().await["{d_minute_alice_}_tb60_b"].0,
+        "1000000095000000"
+    );
+}
+
+/// The quota lookup shows the bucket's level, in debt too, and when it is full, changing
+/// nothing.
+#[tokio::test]
+async fn quota_lookups_show_a_token_buckets_level() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(BUCKET, Settings::default()).await;
+    let alice: &[&[(&str, &str)]] = &[&[("minute", "alice")]];
+    h.at(1_000_000_000);
+    let limit = async || {
+        let lookup = h
+            .subject
+            .service
+            .lookup(&request("d", alice))
+            .await
+            .unwrap();
+        let rendered: serde_json::Value =
+            serde_json::from_str(&ratelimit::quota::render(&lookup)).unwrap();
+        rendered["descriptors"][0]["limits"][0].clone()
+    };
+    let full = limit().await;
+    assert_eq!(full["level"], 60);
+    assert_eq!(full["remaining"], 60);
+    assert_eq!(full["used"], 0);
+    assert_eq!(full["resets_in_s"], 0);
+    assert_eq!(
+        full["window"],
+        serde_json::json!({"type": "token_bucket", "duration_s": 60, "burst": 60})
+    );
+    assert!(h.keys().await.is_empty());
+    h.call(hits(alice, 90)).await;
+    let debt = limit().await;
+    assert_eq!(debt["level"], -30);
+    assert_eq!(debt["remaining"], 0);
+    assert_eq!(debt["used"], 90);
+    assert_eq!(debt["used_pct"], 150.0);
+    assert_eq!(debt["resets_in_s"], 90);
+    assert_eq!(debt["limit"], 60);
+}
+
+/// `RateLimit-Reset` is the bucket's, from the status: the clock's re-read could not know it.
+/// A bucket shares a list with other limits, each in its own key (D7).
+#[tokio::test]
+async fn token_buckets_answer_headers_and_share_lists() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        service: ServiceSettings {
+            response_headers: Some(LimitHeaders::default()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let yaml = "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: rate, requests_per_unit: 60, window: {type: token_bucket, duration: 60s}}
+      - {name: week, requests_per_unit: 1000, window: {type: fixed, duration: 7d}}
+";
+    let h = Extended::start(yaml, settings).await;
+    let alice: &[&[(&str, &str)]] = &[&[("user", "alice")]];
+    h.at(1_000_000_000);
+    let response = h.call(hits(alice, 50)).await;
+    let headers: BTreeMap<String, String> = response
+        .response_headers_to_add
+        .into_iter()
+        .map(|header| (header.key, header.value))
+        .collect();
+    assert_eq!(headers["RateLimit-Limit"], "60");
+    assert_eq!(headers["RateLimit-Remaining"], "10");
+    assert_eq!(headers["RateLimit-Reset"], "50");
+    assert_eq!(h.keys().await.len(), 2);
+}
+
+/// The script decides as [`TokenBucketWindow::step`] does, over random sequences through three
+/// instances on a Redis Cluster, intervals that are not whole included (D32.4). Then charges
+/// race across the instances: none is lost, since the deadline ends up the same.
+#[tokio::test]
+async fn the_token_bucket_script_steps_like_the_rust_window_on_a_cluster() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit::config::window::{BucketOp, MaxDebt, TokenBucketWindow};
+    let cluster = RedisCluster::start().await;
+    let instances = [
+        clustered_service(&cluster.nodes, BUCKET).await,
+        clustered_service(&cluster.nodes, BUCKET).await,
+        clustered_service(&cluster.nodes, BUCKET).await,
+    ];
+    let at = |now: i64| {
+        for (_, clock) in &instances {
+            clock.0.store(now, Ordering::SeqCst);
+        }
+    };
+    let buckets = [
+        (
+            "minute",
+            60,
+            TokenBucketWindow {
+                duration: 60,
+                burst: None,
+                max_debt: None,
+            },
+        ),
+        (
+            "small",
+            60,
+            TokenBucketWindow {
+                duration: 60,
+                burst: Some(10),
+                max_debt: Some(MaxDebt::Tokens(0)),
+            },
+        ),
+        (
+            "free",
+            60,
+            TokenBucketWindow {
+                duration: 60,
+                burst: None,
+                max_debt: Some(MaxDebt::Unlimited),
+            },
+        ),
+        (
+            "slow",
+            7,
+            TokenBucketWindow {
+                duration: 3600,
+                burst: Some(3),
+                max_debt: Some(MaxDebt::Seconds(600)),
+            },
+        ),
+    ];
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    for (key, requests, window) in buckets {
+        let mut tat: Option<f64> = None;
+        let mut now: i64 = 1_000_000_000;
+        for step in 0..300 {
+            now += match next(10) {
+                0 => 200 + next(4000) as i64,
+                1 => -(next(30) as i64),
+                _ => next(90) as i64,
+            };
+            at(now);
+            let op = BucketOp {
+                now,
+                hits: match next(4) {
+                    0 => 0,
+                    _ => next(40),
+                },
+                refund: next(6) == 0,
+            };
+            let expected = window.step(tat, op, requests);
+            // The script writes only a change, and a full bucket has no key, which matters
+            // when the clock goes back.
+            if expected.after != expected.before {
+                tat = (expected.after > now as f64 * 1e6).then_some(expected.after);
+            }
+            let mut request = hits(&[&[(key, "k")]], op.hits);
+            request.descriptors[0].is_negative_hits = op.refund;
+            let (service, _) = &instances[next(3) as usize];
+            let status = service.should_rate_limit(&request).await.unwrap().statuses[0].clone();
+            let admitted = op.refund || window.admits(expected.before, now, requests);
+            let wanted = match admitted {
+                true => (
+                    Code::Ok,
+                    window.remaining(expected.after, now, requests),
+                    window.until_full(expected.after, now),
+                ),
+                false => (
+                    Code::OverLimit,
+                    0,
+                    window.until_admitted(expected.after, now, requests),
+                ),
+            };
+            assert_eq!(
+                (
+                    status.code(),
+                    status.limit_remaining,
+                    status.duration_until_reset.unwrap().seconds
+                ),
+                wanted,
+                "{key} step {step} at {now}: {op:?}"
+            );
+        }
+    }
+    let now = 1_100_000_000;
+    at(now);
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..30 {
+        let service = instances[i % 3].0.clone();
+        tasks.spawn(async move {
+            service
+                .should_rate_limit(&hits(&[&[("free", "race")]], 1))
+                .await
+                .unwrap();
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+    let status = instances[0]
+        .0
+        .should_rate_limit(&hits(&[&[("free", "race")]], 0))
+        .await
+        .unwrap()
+        .statuses[0]
+        .clone();
+    assert_eq!(status.limit_remaining, 30);
+    assert_eq!(status.duration_until_reset.unwrap().seconds, 30);
+}
+
+/// What a bucket's settings may not do well is warned about at load: one taking a day to fill
+/// (D11), and `quota_mode` with `max_debt: unlimited`, which a gauge reports too (D19).
+#[tokio::test]
+async fn token_buckets_warn_of_what_does_not_suit_them() {
+    if !tools_available() {
+        return;
+    }
+    let yaml = "domain: llm
+descriptors:
+  - key: day
+    rate_limits:
+      - {name: b, requests_per_unit: 1000, window: {type: token_bucket, duration: 1d}}
+  - key: hours
+    rate_limits:
+      - {name: b, requests_per_unit: 1000, window: {type: token_bucket, duration: 23h}}
+  - key: burst
+    rate_limits:
+      - {name: b, requests_per_unit: 269, window: {type: token_bucket, duration: 1h, burst: 6456}}
+  - key: quota
+    quota_mode: true
+    rate_limits:
+      - {name: b, requests_per_unit: 10, window: {type: token_bucket, duration: 1m, max_debt: unlimited}}
+";
+    let runtime = temp_dir("token-bucket-warnings");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", yaml.as_bytes()),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    let grpc = reserved_port();
+    let mut environment = binary_environment(&runtime, &redis);
+    environment.extend([
+        ("LOG_LEVEL", "warn".to_string()),
+        ("GRPC_HOST", "127.0.0.1".to_string()),
+        ("GRPC_PORT", grpc.to_string()),
+        ("HOST", "127.0.0.1".to_string()),
+        ("PORT", reserved_port().to_string()),
+        ("DEBUG_HOST", "127.0.0.1".to_string()),
+        ("DEBUG_PORT", reserved_port().to_string()),
+    ]);
+    let stderr = logged_run(
+        std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+        &environment,
+        &format!("http://127.0.0.1:{grpc}"),
+    )
+    .await;
+    assert!(
+        stderr.contains("llm.day~b: this token_bucket takes a day"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("llm.hours~b"), "{stderr}");
+    assert!(
+        stderr.contains("llm.burst~b: this token_bucket takes a day"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("llm.quota~b: quota_mode with max_debt: unlimited"),
+        "{stderr}"
+    );
+
+    let h = Extended::start(
+        &yaml.replace("domain: llm", "domain: d"),
+        Settings::default(),
+    )
+    .await;
+    assert_eq!(
+        h.subject
+            .stats
+            .gauges()
+            .get("ratelimit.service.config_lasting_lockouts"),
+        Some(&1)
+    );
+    let h = Extended::start(BUCKET, Settings::default()).await;
+    assert_eq!(
+        h.subject
+            .stats
+            .gauges()
+            .get("ratelimit.service.config_lasting_lockouts"),
+        None
+    );
+    // On a config without any, the gauge goes back to 0; `QUOTA_MODE` counts as `quota_mode`.
+    let h = Extended::start(
+        &yaml.replace("domain: llm", "domain: d"),
+        Settings::default(),
+    )
+    .await;
+    let file = |content: &str| ConfigFile {
+        name: "config.yaml".into(),
+        content: content.into(),
+    };
+    h.subject
+        .service
+        .set_config(config::load(&[file(BUCKET)], &LoadOptions::default()).unwrap());
+    let gauge = "ratelimit.service.config_lasting_lockouts";
+    assert_eq!(h.subject.stats.gauges().get(gauge), Some(&0));
+    let global = LoadOptions {
+        global_quota_mode: true,
+        ..Default::default()
+    };
+    h.subject
+        .service
+        .set_config(config::load(&[file(BUCKET)], &global).unwrap());
+    assert_eq!(h.subject.stats.gauges().get(gauge), Some(&1));
 }
 
 /// `LIMIT_PER_UNIT_HEADERS_ENABLED` describes every limit of every list, a window of several

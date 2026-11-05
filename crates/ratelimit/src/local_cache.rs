@@ -2,8 +2,9 @@
 //! expires (`LOCAL_CACHE_SIZE_IN_BYTES`).
 //!
 //! A port of the parts of `github.com/coocood/freecache` v1.2.4 that upstream uses — `Set` with
-//! an empty value and `Get` — down to the byte layout of its ring buffers, so that which keys are
-//! evicted when the cache is full matches upstream exactly. Times are Unix seconds from the
+//! an empty value and `Get` — and, for token buckets, `TTL` and `Del`, down to the byte layout of
+//! its ring buffers, so that which keys are evicted when the cache is full matches upstream
+//! exactly. Times are Unix seconds from the
 //! request's clock (freecache's timer).
 
 use std::sync::Mutex;
@@ -52,6 +53,19 @@ impl LocalCache {
         let hash = xxh64(key.as_bytes(), 0);
         self.segment(hash)
             .set(key.as_bytes(), hash, ttl_seconds, now as u32)
+    }
+
+    /// freecache's `TTL`: the seconds until `key` expires at `now`, if it is cached and
+    /// expires. Neither a hit nor a miss.
+    pub fn ttl(&self, key: &str, now: i64) -> Option<i64> {
+        let hash = xxh64(key.as_bytes(), 0);
+        self.segment(hash).ttl(key.as_bytes(), hash, now as u32)
+    }
+
+    /// freecache's `Del`.
+    pub fn remove(&self, key: &str) {
+        let hash = xxh64(key.as_bytes(), 0);
+        self.segment(hash).del(key.as_bytes(), hash);
     }
 
     fn segment(&self, hash: u64) -> std::sync::MutexGuard<'_, Segment> {
@@ -336,6 +350,28 @@ impl Segment {
         self.rb.write_at(&hdr.encode(), ptr.offset);
         self.counts.hits += 1;
         true
+    }
+
+    /// `seg.ttl`, an entry without an expiry having none.
+    fn ttl(&self, key: &[u8], hash: u64, now: u32) -> Option<i64> {
+        let (slot_id, hash16) = slot_and_hash16(hash);
+        let (idx, matched) = self.lookup(slot_id, hash16, key);
+        if !matched {
+            return None;
+        }
+        let ptr = self.slots_data[self.slot_range(slot_id).start + idx];
+        let hdr = self.read_header(ptr.offset);
+        (hdr.expire_at != 0 && !is_expired(hdr.expire_at, now))
+            .then(|| i64::from(hdr.expire_at - now))
+    }
+
+    /// `seg.del`.
+    fn del(&mut self, key: &[u8], hash: u64) {
+        let (slot_id, hash16) = slot_and_hash16(hash);
+        let (idx, matched) = self.lookup(slot_id, hash16, key);
+        if matched {
+            self.del_entry_ptr(slot_id, idx);
+        }
     }
 
     fn expand(&mut self) {

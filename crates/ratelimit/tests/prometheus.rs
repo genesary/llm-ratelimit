@@ -111,6 +111,19 @@ async fn the_listener_binds_like_go() {
 /// The shipped mapper puts the quota lookup's error cause in a label (ADR 0003), and its
 /// response time in seconds, unless `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS`.
 #[test]
+fn the_default_mapper_maps_the_lasting_lockouts_gauge() {
+    use ratelimit::stats::prometheus::MetricType;
+    let mapper = prometheus::load_mapper(&PrometheusSettings::default()).unwrap();
+    let gauge = mapper
+        .get_mapping(
+            "ratelimit.service.config_lasting_lockouts",
+            MetricType::Gauge,
+        )
+        .unwrap();
+    assert_eq!(gauge.name, "ratelimit_service_config_lasting_lockouts");
+}
+
+#[test]
 fn the_default_mapper_maps_quota_lookup_stats() {
     use ratelimit::stats::prometheus::MetricType;
     let mapper = prometheus::load_mapper(&PrometheusSettings::default()).unwrap();
@@ -161,6 +174,7 @@ fn the_default_mapper_labels_list_limits() {
         "slots_released",
         "slots_expired",
         "releases_without_slot",
+        "total_capped_hits",
     ] {
         let cases = [
             (

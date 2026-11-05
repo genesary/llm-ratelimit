@@ -23,6 +23,7 @@ Each decision is one pipeline on one connection:
 - **`rate_limit:` limits and `fixed` windows:** `INCRBY` then `EXPIRE` for each key.
 - **`anchored` windows:** one Lua script (`EVAL`) per key, which opens, counts and closes the session.
 - **`concurrency` windows:** one Lua script (`EVAL`) per key and operation, on a sorted set of slots.
+- **`token_bucket` windows:** one Lua script (`EVAL`) per key, which moves the deadline at which the bucket is full.
 - **Refunds** of `rate_limit:` limits and `fixed` windows: one Lua script per key, which subtracts, floors at 0 and sets the TTL again.
 
 The server must therefore run Lua scripts.
@@ -231,7 +232,7 @@ llm_api_x_1793303040
 - **The name** comes last.
 - **`share_threshold`.** With it, the matched wildcard pattern takes the value's place in both kinds of key.
 
-A `concurrency` window's key is a sorted set of slots, scored by when each was acquired, with the shape `cc`: `{llm_inflight_user_alice_model_qwen3_}_cc_inflight`. A `fixed` window's key holds a counter. An `anchored` window's key is a hash: its anchor (`a`, Unix seconds) and its count (`c`).
+A `token_bucket` window's key holds the deadline at which it is full, in microseconds, with the shape `tb<duration>`. A `concurrency` window's key is a sorted set of slots, scored by when each was acquired, with the shape `cc`: `{llm_inflight_user_alice_model_qwen3_}_cc_inflight`. A `fixed` window's key holds a counter. An `anchored` window's key is a hash: its anchor (`a`, Unix seconds) and its count (`c`).
 
 ```text
 $ redis-cli hgetall '{llm_user_alice_}_an18000_session'
@@ -253,6 +254,7 @@ Every key expires:
 | `fixed` window | The window's duration, plus jitter. |
 | `anchored` window | Until the session ends, plus 60 s. Set when the session opens. |
 | `concurrency` window | The lease, plus 60 s. Set by every operation that leaves a slot. |
+| `token_bucket` window | Until it is full, plus 60 s. Set by every write. A full bucket has no key. |
 
 - **`EXPIRATION_JITTER_MAX_SECONDS`** (default `300`) adds a random number of seconds in `[0, max)` to each TTL, so that keys do not all expire at once. 0 adds none.
 - **Refunds** on Redis set a `rate_limit:` or `fixed` key's TTL again, to a full window plus jitter. An anchored key keeps expiring with its session.
@@ -281,7 +283,7 @@ With `BACKEND_TYPE=memcache`:
 
 **Failures do not fail the decision.** A read that fails, a key memcached cannot take (over 250 bytes, or with spaces or control characters), or a value that is not a number is logged, and the request is answered from what was read: an unread counter counts as 0. Keep descriptor values short and free of spaces; a `rate_limits:` key, with its hash tag, shape and name, is longer than a `rate_limit:` one. A warning at load names a `rate_limits:` limit whose key takes over 186 bytes before its window's start and the request's values.
 
-**What Memcached cannot count.** `anchored` and `concurrency` windows need a script that reads and writes atomically. A configuration with one is refused at load on Memcached: `only fixed windows can be counted on Memcached`. `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` has no effect on Memcached.
+**What Memcached cannot count.** `anchored`, `concurrency` and `token_bucket` windows need a script that reads and writes atomically. A configuration with one is refused at load on Memcached: `only fixed windows can be counted on Memcached`. `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` has no effect on Memcached.
 
 The client's operations are counted in the `memcache.*` stats.
 
@@ -295,9 +297,10 @@ LOCAL_CACHE_SIZE_IN_BYTES=10485760   # 10 MiB
 
 - **What it holds.** The key of a `rate_limit:` limit or a `fixed` window, once a decision finds it over the limit. It stays for the window's length.
 - **What it never holds.** `anchored` and `concurrency` windows: Redis is asked every time.
+- **`token_bucket` windows** are held once denied, until they would admit again, except in `shadow_mode`. A refund clears the entry on the instance that gets it.
 - **Shadow mode.** A key over its limit is cached even when its limit is in `shadow_mode`. With the cache on, later requests for that key are answered from it, and their hits are not counted in the backend.
-- **Lost hits.** Hits answered from it are never counted in the backend, a token amendment included: on that instance, the limit's count stops growing until its window ends. `anchored` windows are never cached.
-- **Refunds** always reach the backend. They do not remove a key from the local cache: a key cached as over its limit stays so until its entry expires.
+- **Lost hits.** Hits answered from it are never counted in the backend, a token amendment included: on that instance, the limit's count stops growing until its entry ends. `anchored` windows are never cached.
+- **Refunds** always reach the backend. Except for `token_bucket` windows, they do not remove a key from the local cache: a key cached as over its limit stays so until its entry expires.
 - **Memory.** It is a port of [freecache](https://github.com/coocood/freecache), down to its memory layout, so it evicts the same keys as upstream when full. Below 512 KiB, its size is 512 KiB.
 - **Stats.** Requests answered from it count in `over_limit_with_local_cache`; its own figures are in the `localcache.*` gauges.
 

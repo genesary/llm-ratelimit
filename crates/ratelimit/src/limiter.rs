@@ -179,6 +179,8 @@ pub(crate) fn reset(
         Some(Window::Fixed(w)) => Ok(w.reset(now, w.phase(key_entries(descriptor, limit)))),
         Some(Window::Anchored(w)) => Ok(w.reset(None, now)),
         Some(Window::Concurrency(w)) => Ok(w.retry_after),
+        // Only its state knows: decisions and headers read that.
+        Some(Window::TokenBucket(_)) => Ok(0),
         None => reset_seconds(limit.limit.unit(), now, calendar),
     }
 }
@@ -395,6 +397,8 @@ pub struct CacheSettings {
     pub expiration_jitter_max_seconds: i64,
     /// `USE_CALENDAR_MONTH_RATE_LIMIT`: a month is the UTC calendar month, not 30 days.
     pub use_calendar_month: bool,
+    /// `SHADOW_MODE`: the local cache keeps no token bucket then (D18).
+    pub global_shadow_mode: bool,
 }
 
 impl Default for CacheSettings {
@@ -406,6 +410,7 @@ impl Default for CacheSettings {
             near_limit_ratio: 0.8,
             expiration_jitter_max_seconds: 0,
             use_calendar_month: false,
+            global_shadow_mode: false,
         }
     }
 }

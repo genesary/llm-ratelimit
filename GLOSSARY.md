@@ -32,7 +32,7 @@ _Avoid_: rule, quota rule
 
 **Window**:
 The span of time a limit's hits are counted over.
-_Avoid_: bucket, period
+_Avoid_: bucket (but for a token bucket), period
 
 **Fixed window**:
 A window of fixed length starting at the epoch, or at a phase.
@@ -49,6 +49,18 @@ _Avoid_: rolling window, session window
 **Anchor**:
 When an anchored window opened, rounded down to the window's rounding.
 _Avoid_: start time, opening time
+
+**Token bucket**:
+A window that refills continuously: a request is admitted while it holds any token, and charged in full.
+_Avoid_: leaky bucket, rate window
+
+**Deadline**:
+When a token bucket is full again, which is all that is stored of it (GCRA's TAT).
+_Avoid_: reset time
+
+**Debt**:
+How far below empty a token bucket is, within `max_debt`.
+_Avoid_: overdraft
 
 **Concurrency window**:
 A limit on requests in flight rather than on hits over time: a check takes a slot and an amendment gives it back.

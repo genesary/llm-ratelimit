@@ -478,6 +478,7 @@ impl Settings {
             near_limit_ratio: self.near_limit_ratio,
             expiration_jitter_max_seconds: self.expiration_jitter_max_seconds,
             use_calendar_month: self.use_calendar_month_rate_limit,
+            global_shadow_mode: self.shadow_mode,
         }
     }
 
@@ -518,6 +519,7 @@ impl Settings {
             sanitize_descriptor_metric_dots: self.sanitize_descriptor_metric_dots,
             memcached: self.backend_type == "memcache",
             cache_key_prefix: self.cache_key_prefix.clone(),
+            global_quota_mode: self.quota_mode,
         }
     }
 

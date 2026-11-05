@@ -13,6 +13,8 @@ pub enum Window {
     Anchored(AnchoredWindow),
     /// `type: concurrency`.
     Concurrency(ConcurrencyWindow),
+    /// `type: token_bucket`.
+    TokenBucket(TokenBucketWindow),
 }
 
 impl Window {
@@ -22,6 +24,7 @@ impl Window {
             Window::Fixed(w) => w.duration,
             Window::Anchored(w) => w.duration,
             Window::Concurrency(w) => w.lease,
+            Window::TokenBucket(w) => w.duration,
         }
     }
 
@@ -31,6 +34,7 @@ impl Window {
             Window::Fixed(w) => w.shape(),
             Window::Anchored(w) => w.shape(),
             Window::Concurrency(_) => "cc".to_string(),
+            Window::TokenBucket(w) => format!("tb{}", w.duration),
         }
     }
 
@@ -40,6 +44,7 @@ impl Window {
             Window::Fixed(w) => w.describe(),
             Window::Anchored(w) => w.describe(),
             Window::Concurrency(w) => w.describe(),
+            Window::TokenBucket(w) => w.describe(),
         }
     }
 
@@ -384,6 +389,152 @@ impl ConcurrencyWindow {
             "concurrency lease={}s retry_after={}s",
             self.lease, self.retry_after
         )
+    }
+}
+
+/// A `token_bucket` window (D11): GCRA, a single deadline (the TAT, in microseconds) at which
+/// the bucket is full. It refills at `requests_per_unit` tokens per `duration`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenBucketWindow {
+    /// Its length, in seconds.
+    pub duration: i64,
+    /// `burst`: its capacity, by default `requests_per_unit`.
+    pub burst: Option<u64>,
+    /// `max_debt`: how far below empty it can go, by default a whole `burst`.
+    pub max_debt: Option<MaxDebt>,
+}
+
+/// A token bucket's `max_debt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxDebt {
+    Tokens(u64),
+    /// What the bucket refills in this many seconds.
+    Seconds(i64),
+    Unlimited,
+}
+
+/// The largest deadline, in microseconds: a double is exact up to here (the year 2255).
+pub const MAX_TAT: f64 = 9_007_199_254_740_992.0;
+
+/// What a request does to a token bucket.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BucketOp {
+    /// In seconds.
+    pub now: i64,
+    pub hits: u64,
+    pub refund: bool,
+}
+
+/// What an operation found and left: the deadlines in microseconds, and the hits past
+/// `max_debt`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BucketResult {
+    pub before: f64,
+    pub after: f64,
+    pub capped: u64,
+}
+
+impl TokenBucketWindow {
+    /// How many microseconds a token takes to refill.
+    pub fn interval(&self, requests_per_unit: u32) -> f64 {
+        self.duration as f64 * 1e6 / f64::from(requests_per_unit)
+    }
+
+    /// Its capacity, in tokens.
+    pub fn capacity(&self, requests_per_unit: u32) -> u64 {
+        self.burst.unwrap_or(u64::from(requests_per_unit))
+    }
+
+    /// How far past `now` the deadline may go, in microseconds: `None` without a limit.
+    pub fn deadline_limit(&self, requests_per_unit: u32) -> Option<f64> {
+        let capacity = self.capacity(requests_per_unit) as f64;
+        let interval = self.interval(requests_per_unit);
+        let debt = match self.max_debt {
+            None => capacity,
+            Some(MaxDebt::Tokens(tokens)) => tokens as f64,
+            Some(MaxDebt::Seconds(seconds)) => seconds as f64 * 1e6 / interval,
+            Some(MaxDebt::Unlimited) => return None,
+        };
+        Some((capacity + debt) * interval)
+    }
+
+    /// The state after `op`, `tat` being the stored deadline. The Redis script
+    /// ([`crate::redis`]) does the same. A deadline is whole microseconds, so past a million
+    /// tokens a second, a hit costs more than its token.
+    pub fn step(&self, tat: Option<f64>, op: BucketOp, requests_per_unit: u32) -> BucketResult {
+        let now = op.now as f64 * 1e6;
+        let interval = self.interval(requests_per_unit);
+        let before = tat.unwrap_or(now).max(now);
+        let hits = op.hits as f64;
+        let (after, capped) = if op.refund {
+            (now.max(before - hits * interval), 0)
+        } else {
+            let after = before + hits * interval;
+            let most = match self.deadline_limit(requests_per_unit) {
+                Some(limit) => (now + limit).min(MAX_TAT),
+                None => MAX_TAT,
+            }
+            // A charge never moves the deadline back.
+            .max(before);
+            match after > most {
+                true => (most, hits.min(((after - most) / interval).ceil()) as u64),
+                false => (after, 0),
+            }
+        };
+        BucketResult {
+            before,
+            after: after.ceil(),
+            capped,
+        }
+    }
+
+    /// The tokens in the bucket with this deadline at `now`: negative in debt.
+    pub fn level(&self, tat: f64, now: i64, requests_per_unit: u32) -> f64 {
+        let used = (tat - now as f64 * 1e6).max(0.0) / self.interval(requests_per_unit);
+        self.capacity(requests_per_unit) as f64 - used
+    }
+
+    /// Whether the bucket is not empty, which admits a request of any size (D11).
+    pub fn admits(&self, tat: f64, now: i64, requests_per_unit: u32) -> bool {
+        self.level(tat, now, requests_per_unit) > 0.0
+    }
+
+    /// Usage: the capacity minus the whole tokens left, past the capacity in debt (D22).
+    pub fn used(&self, tat: f64, now: i64, requests_per_unit: u32) -> u64 {
+        let level = self.level(tat, now, requests_per_unit).floor();
+        (self.capacity(requests_per_unit) as f64 - level) as u64
+    }
+
+    /// The whole tokens left, never below 0.
+    pub fn remaining(&self, tat: f64, now: i64, requests_per_unit: u32) -> u32 {
+        self.level(tat, now, requests_per_unit)
+            .floor()
+            .clamp(0.0, f64::from(u32::MAX)) as u32
+    }
+
+    /// The seconds until the bucket is full, rounded up (D12).
+    pub fn until_full(&self, tat: f64, now: i64) -> i64 {
+        ((tat - now as f64 * 1e6).max(0.0) / 1e6).ceil() as i64
+    }
+
+    /// The seconds until a denied request would be admitted: strictly past the instant the
+    /// level reaches 0, so at least 1 (D12).
+    pub fn until_admitted(&self, tat: f64, now: i64, requests_per_unit: u32) -> i64 {
+        let empty_until =
+            tat - self.capacity(requests_per_unit) as f64 * self.interval(requests_per_unit);
+        (((empty_until - now as f64 * 1e6) / 1e6).floor() as i64 + 1).max(1)
+    }
+
+    /// The window as `/rlconfig` shows it: `token_bucket <duration>s`, then its options.
+    pub fn describe(&self) -> String {
+        let burst = self.burst.map_or(String::new(), |b| format!(" burst={b}"));
+        let max_debt = match self.max_debt {
+            None => String::new(),
+            Some(MaxDebt::Tokens(tokens)) => format!(" max_debt={tokens}"),
+            Some(MaxDebt::Seconds(seconds)) => format!(" max_debt={seconds}s"),
+            Some(MaxDebt::Unlimited) => " max_debt=unlimited".to_string(),
+        };
+        format!("token_bucket {}s{burst}{max_debt}", self.duration)
     }
 }
 

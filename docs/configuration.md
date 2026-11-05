@@ -585,6 +585,27 @@ window: {type: anchored, duration: 5h, open_on: first_hit}
 
 `anchored` windows are counted on Redis only, in one script per request: they are refused at load with `BACKEND_TYPE=memcache`. The local cache never holds them, so Redis is asked every time.
 
+### `token_bucket`
+
+A bucket that refills continuously at `requests_per_unit` tokens per `duration`: usage is smoothed, with no reset to wait for and no cliff at a window's end.
+
+```yaml
+window: {type: token_bucket, duration: 5h}                                   # holds what 5 h refill
+window: {type: token_bucket, duration: 1m, burst: 500}                       # holds 500, whatever the rate
+window: {type: token_bucket, duration: 1m, max_debt: 10m}                    # debt of up to 10 min of refill
+```
+
+- **`burst`** (a whole number of tokens above 0, by default `requests_per_unit`): how many tokens it holds. A bucket starts full.
+- **A decision:** a bucket with any token in it admits the request, whatever its size, and charges it in full. An empty one denies it, and charges it too, as `overflow: envoy` counts denied hits, unless the local cache answers. A check (0 hits) charges nothing.
+- **`max_debt`** (by default a whole `burst`): how far below empty a charge can take the bucket. Tokens, as `500`; or a duration, as `10m`, for what refills in it; or `0` to stop at empty; or `unlimited`. Hits past it are truncated, and counted in `total_capped_hits`.
+- **`limit_remaining`** is the whole tokens left, at least 0. `current_limit` and the `RateLimit-Limit` headers report `requests_per_unit`, so with a larger `burst`, what remains can exceed them; [`/quota`](quota-lookup.md) reports the capacity.
+- **`duration_until_reset`:** allowed, the time until the bucket is full; denied, the time until it admits again, at least 1 s.
+- **Refunds** give tokens back, up to full. They never let it hold more than `burst`.
+
+`requests_per_unit` must be above 0. A bucket taking 24 h or more to fill gets a warning at load: it does not suit a daily or weekly budget, for which use `fixed` with an offset. `quota_mode` with `max_debt: unlimited` gets one too, and counts in the `config_lasting_lockouts` gauge, since a group can stay blocked as long as traffic exceeds the rate.
+
+**With other settings:** it may share a list with other windows, and `shadow_mode` works as for any list limit. `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` has no effect. It is refused at load on Memcached. The [local cache](backends.md#the-local-cache) holds a denied bucket until it would admit again.
+
 ### `concurrency`
 
 A limit on requests in flight rather than on hits over time, to keep one user from flooding a model. `requests_per_unit` is the most requests in flight:
@@ -736,7 +757,8 @@ Error loading new configuration: config.messaging.yaml: invalid rate limit unit 
 - `rate_limits entries cannot be unlimited: use rate_limit: {unlimited: true}`
 - `replaces should not contain a name of the same rate_limits`
 - `window is required`, `window type is required`, `unknown window type 'x'`
-- `window type 'sliding' is not supported yet`, and the same for `sliding_approx` and `token_bucket`
+- `window type 'sliding' is not supported yet`, and the same for `sliding_approx`
+- `invalid burst 'x'`, `invalid max_debt 'x'`, `burst is for token_bucket windows`, `offset is not for token_bucket windows`, `a token_bucket needs requests_per_unit above 0`, and the same for the other keys
 - `lease is required`, `invalid lease 'x'`, `invalid retry_after 'x'`, `lease is for concurrency windows`, `duration is not for concurrency windows`, and the same for the other keys
 - `a concurrency limit must be alone in its rate_limits: hits release its slots`, `a concurrency limit cannot be in quota_mode`
 - `window duration is required`, `invalid window duration '1.5h'`

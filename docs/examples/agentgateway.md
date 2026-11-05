@@ -150,6 +150,27 @@ spec:
             unit: Tokens
 ```
 
+## A smoothed session
+
+A [`token_bucket`](../configuration.md#token_bucket) can stand in for the `anchored` session: a bucket holding about a five-hour session, refilling continuously.
+
+```yaml
+      - name: session
+        requests_per_unit: 4000000          # refilled in 5 h, and what the bucket holds
+        window: {type: token_bucket, duration: 5h}
+```
+
+| | `anchored` | `token_bucket` |
+|---|---|---|
+| At the end of the budget | A wall, then everything back at once when the session ends: everyone who hit it comes back together. | Tokens return continuously: a user who runs out can go on at the refill rate. No cliff at a reset. |
+| What users see | "40 %, resets in 2 h 05": a countdown anyone understands. | A level that moves by itself, and a "full in" time that says less. Harder to read and to plan with. |
+| Unused budget | Lost when the session ends. | Stops refilling at full: lost too, without a moment to name. |
+| An overshoot | The last amendment passes 100 %, and the user waits for the session's end. | The debt, one bucket at most by default, delays the next request by up to 5 h. Lower it with `max_debt`. |
+
+Choose the bucket if your load comes in surges at session resets, and the countdown if users need to plan around a clear limit. It takes under a day to fill: past that, a bucket gets a warning, and a weekly budget stays a `fixed` window.
+
+Leave the local cache off here too: an amendment on a bucket held there is not counted. `/quota` then shows `level`, negative in debt, `used_pct`, and `resets_in_s`, the time until it is full.
+
 ## Limiting requests in flight
 
 Volume quotas do not protect a busy GPU node from one harness sending many requests at once. A [`concurrency` window](../configuration.md#concurrency) limits what a user has in flight, per model, so that being limited on one model leaves the others free. It uses a second descriptor, and nothing else changes:

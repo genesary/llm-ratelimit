@@ -11,7 +11,8 @@ pub use connection::{Connected, RedisConnection, StartupBackoff, Tls, mask_crede
 
 use crate::config::RateLimit;
 use crate::config::window::{
-    Anchored, AnchoredWindow, ConcurrencyWindow, MAX_ANCHORED_COUNT, OpenOn, SlotResult, Window,
+    Anchored, AnchoredWindow, BucketResult, ConcurrencyWindow, MAX_ANCHORED_COUNT, MAX_TAT, OpenOn,
+    SlotResult, TokenBucketWindow, Window,
 };
 use crate::limiter::{self, CacheSettings, Clock, Count, Hits, RequestState};
 use crate::local_cache::LocalCache;
@@ -93,6 +94,44 @@ local in_flight = redis.call('ZCARD', KEYS[1])
 if in_flight > 0 then redis.call('EXPIRE', KEYS[1], ARGV[3]) end
 return {acquired, released, expired, in_flight}
 ";
+
+/// A `token_bucket` window (docs/design.md D11), as [`TokenBucketWindow::step`] decides it: the
+/// deadline at which the bucket is full, in microseconds. ARGV: now, a token's interval, how
+/// far past now a charge may go (-1: no limit), the largest deadline, hits, refund (1) or
+/// not (0), TTL margin. Returns the deadlines before and after, and the hits past the limit.
+const TOKEN_BUCKET_SCRIPT: &str = "
+local now, interval, limit = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local largest, hits = tonumber(ARGV[4]), tonumber(ARGV[5])
+local stored = tonumber(redis.call('GET', KEYS[1])) or now
+local before = math.max(stored, now)
+local after, capped = before, 0
+if ARGV[6] == '1' then
+  after = math.max(now, before - hits * interval)
+else
+  after = before + hits * interval
+  local most = largest
+  if limit >= 0 then most = math.min(now + limit, largest) end
+  most = math.max(most, before)
+  if after > most then
+    capped = math.min(hits, math.ceil((after - most) / interval))
+    after = most
+  end
+end
+after = math.ceil(after)
+if after ~= before then
+  if after > now then
+    redis.call('SET', KEYS[1], string.format('%.0f', after))
+    redis.call('EXPIRE', KEYS[1], math.ceil((after - now) / 1000000) + tonumber(ARGV[7]))
+  else
+    redis.call('DEL', KEYS[1])
+  end
+end
+return {string.format('%.0f', before), string.format('%.0f', after), string.format('%.0f', capped)}
+";
+
+/// How long a token bucket's key outlives the moment it is full, for replicas whose clocks are
+/// behind.
+const TOKEN_BUCKET_MARGIN_SECONDS: i64 = 60;
 
 /// How long a concurrency window's key outlives its newest lease.
 const CONCURRENCY_MARGIN_SECONDS: i64 = 60;
@@ -393,6 +432,11 @@ impl RateLimitCache for RedisCache {
                 commands.push(release_command(window, &c.key, c.hits.value, now));
                 continue;
             }
+            if let Some(Window::TokenBucket(window)) = &c.limit.window {
+                let requests = c.limit.limit.requests_per_unit;
+                commands.push(bucket_command(window, &c.key, c.hits, now, requests));
+                continue;
+            }
             // An anchored window's key expires with the window, which the script knows.
             if let Some(Window::Anchored(window)) = &c.limit.window {
                 commands.push(anchored_command(window, &c.key, c.hits, now));
@@ -468,6 +512,8 @@ impl RateLimitCache for RedisCache {
             limits.iter().map(|list| vec![None; list.len()]).collect();
         let mut opened_without_hits: Vec<Vec<bool>> =
             limits.iter().map(|list| vec![false; list.len()]).collect();
+        let mut buckets: Vec<Vec<Option<BucketResult>>> =
+            limits.iter().map(|list| vec![None; list.len()]).collect();
         for (index, slot, pipeline, at) in reply_of {
             let reply = replies[pipeline][at].clone();
             let command = &pipelines[pipeline][at];
@@ -475,6 +521,10 @@ impl RateLimitCache for RedisCache {
                 let result = command.slots(reply)?;
                 count_slots(&self.stats, &limits[index][slot], result, hits[index].value);
                 counts[index][slot] = Count::After(result.in_flight);
+                continue;
+            }
+            if let Some(Window::TokenBucket(_)) = &limits[index][slot].window {
+                buckets[index][slot] = Some(command.bucket(reply)?);
                 continue;
             }
             let Some(Window::Anchored(window)) = &limits[index][slot].window else {
@@ -489,12 +539,18 @@ impl RateLimitCache for RedisCache {
         for c in &checks {
             if c.over_in_local_cache {
                 counts[c.index][c.slot] = Count::OverInLocalCache;
+                // Only the entry knows when the bucket it holds admits again.
+                if let (Some(Window::TokenBucket(_)), Some(cache)) =
+                    (&c.limit.window, &self.local_cache)
+                {
+                    resets[c.index][c.slot] = Some(cache.ttl(&c.key, now).unwrap_or(1));
+                }
             } else if let (false, Count::After(after), Some(cache)) =
                 (c.hits.refund, counts[c.index][c.slot], &self.local_cache)
                 && limiter::exceeds(c.limit, after)
                 && !matches!(
                     c.limit.window,
-                    Some(Window::Anchored(_) | Window::Concurrency(_))
+                    Some(Window::Anchored(_) | Window::Concurrency(_) | Window::TokenBucket(_))
                 )
             {
                 // Cached for a whole window, shadow rules included, as upstream.
@@ -522,6 +578,16 @@ impl RateLimitCache for RedisCache {
                     status: slots_status(c.limit, window, in_flight),
                     opened_without_hits: false,
                     slot_pending: slot_pending(c.hits),
+                });
+                continue;
+            }
+            if let (Some(Window::TokenBucket(window)), Some(result)) =
+                (&c.limit.window, buckets[c.index][c.slot])
+            {
+                statuses[c.index].push(LimitOutcome {
+                    status: self.bucket_status(c, window, result, now),
+                    opened_without_hits: false,
+                    slot_pending: false,
                 });
                 continue;
             }
@@ -679,6 +745,124 @@ type PendingSlot<'a> = (
     Option<String>,
 );
 
+impl RedisCache {
+    /// A token bucket's status (D11): a bucket that is not empty admits; a refund is always OK.
+    /// Its outcome counted (D22), and a denied bucket kept in the local cache until it would
+    /// admit, a refund clearing it (D18).
+    fn bucket_status(
+        &self,
+        c: &Counted<'_>,
+        window: &TokenBucketWindow,
+        result: BucketResult,
+        now: i64,
+    ) -> DescriptorStatus {
+        let requests = c.limit.limit.requests_per_unit;
+        let admitted = c.hits.refund || window.admits(result.before, now, requests);
+        if c.hits.refund {
+            if let Some(cache) = &self.local_cache {
+                cache.remove(&c.key);
+            }
+        } else {
+            count_bucket(
+                c,
+                window,
+                result,
+                admitted,
+                now,
+                self.settings.near_limit_ratio,
+            );
+        }
+        if result.capped > 0 {
+            self.stats
+                .rate_limit_counter(&c.limit.full_key, "total_capped_hits")
+                .add(result.capped);
+        }
+        if !admitted {
+            let wait = window.until_admitted(result.after, now, requests);
+            // freecache's expiry is 32 bits: a wait past it is not worth an entry.
+            let shadow = c.limit.shadow_mode || self.settings.global_shadow_mode;
+            if let (false, true, Some(cache)) = (shadow, wait < 1 << 31, &self.local_cache)
+                && !cache.insert(&c.key, wait, now)
+            {
+                crate::log::error(&format!("Failing to set local cache key: {}", c.key));
+            }
+            return limiter::status(Code::OverLimit, c.limit, 0, wait);
+        }
+        limiter::status(
+            Code::Ok,
+            c.limit,
+            window.remaining(result.after, now, requests),
+            window.until_full(result.after, now),
+        )
+    }
+}
+
+/// Splits a token bucket's hits between its counters with legacy arithmetic (D22), usage being
+/// [`TokenBucketWindow::used`]. Unlike the legacy, what is past the capacity may still be
+/// admitted: `within_limit` is then every hit, as it is what `OK` means.
+fn count_bucket(
+    c: &Counted<'_>,
+    window: &TokenBucketWindow,
+    result: BucketResult,
+    admitted: bool,
+    now: i64,
+    near_limit_ratio: f32,
+) {
+    let (stats, hits) = (&c.stats, c.hits.value);
+    let requests = c.limit.limit.requests_per_unit;
+    let capacity = window.capacity(requests);
+    let before = window.used(result.before, now, requests);
+    let after = window.used(result.after, now, requests);
+    let near = f64::from(capacity as f32 * near_limit_ratio).floor() as u64;
+    if admitted {
+        stats.within_limit.add(hits);
+    }
+    if !admitted || after > capacity {
+        let over = if before >= capacity {
+            hits
+        } else {
+            (after - capacity).min(hits)
+        };
+        stats.over_limit.add(over);
+        if before < capacity {
+            stats.near_limit.add(capacity - near.max(before));
+        }
+        if c.limit.shadow_mode {
+            stats.shadow_mode.add(over);
+        }
+    } else if after > near {
+        stats
+            .near_limit
+            .add(if before >= near { hits } else { after - near });
+    }
+}
+
+/// The token bucket script's call.
+fn bucket_command(
+    window: &TokenBucketWindow,
+    key: &str,
+    hits: Hits,
+    now: i64,
+    requests_per_unit: u32,
+) -> Command {
+    let limit = window
+        .deadline_limit(requests_per_unit)
+        .map_or("-1".to_string(), |limit| limit.to_string());
+    let args = vec![
+        TOKEN_BUCKET_SCRIPT.to_string(),
+        "1".to_string(),
+        key.to_string(),
+        (now as f64 * 1e6).to_string(),
+        window.interval(requests_per_unit).to_string(),
+        limit,
+        MAX_TAT.to_string(),
+        (hits.value as f64).to_string(),
+        if hits.refund { "1" } else { "0" }.to_string(),
+        TOKEN_BUCKET_MARGIN_SECONDS.to_string(),
+    ];
+    Command { name: "EVAL", args }
+}
+
 /// An OK status with `in_flight` slots held.
 fn slots_status(limit: &RateLimit, window: &ConcurrencyWindow, in_flight: u64) -> DescriptorStatus {
     limiter::status(
@@ -831,6 +1015,14 @@ impl RedisCache {
                         reset: open.map(|w| window.reset(Some(w), now)),
                     }
                 }
+                Some(Window::TokenBucket(window)) => {
+                    // No key is a full bucket.
+                    let stored = command.counter(reply)? as f64;
+                    LimitReading {
+                        used: window.used(stored, now, limit.limit.requests_per_unit),
+                        reset: Some(window.until_full(stored, now)),
+                    }
+                }
                 // Slots have no window to reset.
                 Some(Window::Concurrency(_)) => LimitReading {
                     used: command.counter(reply)?,
@@ -872,6 +1064,27 @@ fn anchored_command(window: &AnchoredWindow, key: &str, hits: Hits, now: i64) ->
 }
 
 impl Command {
+    /// The token bucket script's reply, whose deadlines are strings: past 2^53 they would not
+    /// be exact integers, and Lua would truncate them.
+    fn bucket(&self, reply: Value) -> Result<BucketResult, CacheError> {
+        let malformed = || self.failed("a token bucket's reply is not 3 numbers");
+        let Value::Array(values) = reply else {
+            return Err(malformed());
+        };
+        let numbers: Vec<f64> = values
+            .iter()
+            .filter_map(|value| value.as_str()?.parse().ok())
+            .collect();
+        let [before, after, capped] = numbers[..] else {
+            return Err(malformed());
+        };
+        Ok(BucketResult {
+            before,
+            after,
+            capped: capped as u64,
+        })
+    }
+
     /// The concurrency script's reply.
     fn slots(&self, reply: Value) -> Result<SlotResult, CacheError> {
         let malformed = || self.failed("a concurrency window's reply is not 4 integers");

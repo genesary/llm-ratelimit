@@ -80,6 +80,8 @@ pub(crate) struct YamlWindow {
     pub open_on: String,
     pub lease: String,
     pub retry_after: String,
+    pub burst: String,
+    pub max_debt: String,
 }
 
 /// Mapping entries with duplicate keys collapsed, the last one winning, like a Go map.
@@ -164,6 +166,8 @@ impl Place {
                 "open_on",
                 "lease",
                 "retry_after",
+                "burst",
+                "max_debt",
             ]
             .contains(&key),
             Place::Replaces => key == "name",
@@ -492,6 +496,8 @@ impl Decoder {
                 "open_on" => window.open_on = self.string(v),
                 "lease" => window.lease = self.string(v),
                 "retry_after" => window.retry_after = self.string(v),
+                "burst" => window.burst = self.string(v),
+                "max_debt" => window.max_debt = self.string(v),
                 _ => {}
             }
         }

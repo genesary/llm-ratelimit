@@ -322,6 +322,16 @@ impl Stats {
         self.service_counter("config_load_success")
     }
 
+    /// `config_lasting_lockouts`: only once there is something to report, so that a config
+    /// without any flushes what upstream's does (D19).
+    pub fn set_lasting_lockouts(&self, count: u64) {
+        let name = format!("{SERVICE}.config_lasting_lockouts{}", self.tags);
+        let mut gauges = self.gauges.lock().unwrap();
+        if count > 0 || gauges.contains_key(&name) {
+            gauges.entry(name).or_default().set(count);
+        }
+    }
+
     /// `config_load_error`.
     pub fn config_load_error(&self) -> Counter {
         self.service_counter("config_load_error")
