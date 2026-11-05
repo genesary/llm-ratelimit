@@ -15877,6 +15877,190 @@ async fn config_fingerprints_are_reported_at_each_load() {
     );
 }
 
+/// The storage keys of every kind of limit, written out: they are what a deployment's counters
+/// live under, so changing one resets them. Nothing of the project's name is in them.
+#[tokio::test]
+async fn storage_keys_stay_as_they_are() {
+    if !tools_available() {
+        return;
+    }
+    let yaml = "
+domain: d
+descriptors:
+  - key: legacy
+    rate_limit: {unit: hour, requests_per_unit: 100}
+  - key: fixed
+    rate_limits:
+      - {name: week, requests_per_unit: 100, window: {type: fixed, duration: 7d, offset: 4d}}
+  - key: anchored
+    rate_limits:
+      - {name: session, requests_per_unit: 100, window: {type: anchored, duration: 5h, start_rounding: 1h}}
+  - key: bucket
+    rate_limits:
+      - {name: rate, requests_per_unit: 100, window: {type: token_bucket, duration: 60s}}
+  - key: inflight
+    descriptors:
+      - key: model
+        rate_limits:
+          - {name: slots, requests_per_unit: 100, window: {type: concurrency, lease: 10m}}
+";
+    let settings = Settings {
+        cache: CacheSettings {
+            cache_key_prefix: "prefix_".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(yaml, settings).await;
+    h.at(1_000_000_000);
+    for descriptor in [
+        &[("legacy", "a")][..],
+        &[("fixed", "a")][..],
+        &[("anchored", "a")][..],
+        &[("bucket", "a")][..],
+    ] {
+        h.call(hits(&[descriptor], 1)).await;
+    }
+    h.call(hits(&[&[("inflight", "a"), ("model", "org/m:v1.5")]], 0))
+        .await;
+    let reply = resp_command(&h.redis.address, &["KEYS", "*"]).await;
+    let mut keys: Vec<&str> = reply
+        .lines()
+        .filter(|line| !line.starts_with(['*', '$']))
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "prefix_d_legacy_a_999997200",
+            "{prefix_d_anchored_a_}_an18000r3600_session",
+            "{prefix_d_bucket_a_}_tb60_rate",
+            "{prefix_d_fixed_a_}_fx604800o345600_999475200_week",
+            "{prefix_d_inflight_a_model_org/m:v1.5_}_cc_slots",
+        ]
+    );
+}
+
+/// The stats of every kind of limit, and of the service, written out, with what the shipped
+/// mapper makes of them: dashboards and alerts depend on these names.
+#[tokio::test]
+async fn stat_and_metric_names_stay_as_they_are() {
+    use ratelimit::stats::prometheus::{self, MetricType, PrometheusSettings};
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(
+        "
+domain: d
+descriptors:
+  - key: legacy
+    rate_limit: {unit: hour, requests_per_unit: 1}
+  - key: fixed
+    rate_limits:
+      - {name: week, requests_per_unit: 1, window: {type: fixed, duration: 7d}}
+  - key: bucket
+    rate_limits:
+      - {name: rate, requests_per_unit: 1, window: {type: token_bucket, duration: 60s, max_debt: 0}}
+  - key: slots
+    rate_limits:
+      - {name: inflight, requests_per_unit: 1, window: {type: concurrency, lease: 10m}}
+",
+        Settings::default(),
+    )
+    .await;
+    h.at(1_000_000_000);
+    for descriptor in [
+        &[("legacy", "a")][..],
+        &[("fixed", "a")][..],
+        &[("bucket", "a")][..],
+    ] {
+        h.call(hits(&[descriptor], 3)).await;
+    }
+    let slots: &[&[(&str, &str)]] = &[&[("slots", "a")]];
+    for added in [0, 0, 2] {
+        h.call(hits(slots, added)).await;
+    }
+    let mut refund = hits(&[&[("fixed", "a")]], 1);
+    refund.descriptors[0].is_negative_hits = true;
+    h.call(refund).await;
+    let fingerprint = h.subject.service.current_config().unwrap().fingerprints()["d"].clone();
+    let mut stats: Vec<String> = h.subject.stats.snapshot().into_keys().collect();
+    stats.extend(h.subject.stats.gauges().into_keys());
+    stats.sort();
+    let stats: Vec<String> = stats
+        .into_iter()
+        .map(|name| name.replace(&fingerprint, "FINGERPRINT"))
+        .collect();
+    assert_eq!(stats, GOLDEN_STATS);
+    let mapper = prometheus::load_mapper(&PrometheusSettings::default()).unwrap();
+    let mut metrics: Vec<String> = stats
+        .iter()
+        .chain(&GOLDEN_OTHER_STATS.map(str::to_string))
+        .map(|stat| {
+            let stat = stat.replace("FINGERPRINT", &fingerprint);
+            let mapped = [MetricType::Counter, MetricType::Gauge, MetricType::Observer]
+                .into_iter()
+                .find_map(|kind| mapper.get_mapping(&stat, kind));
+            mapped.map_or(format!("{stat} unmapped"), |m| m.name.clone())
+        })
+        .collect();
+    metrics.sort();
+    metrics.dedup();
+    assert_eq!(metrics, GOLDEN_METRICS);
+}
+
+const GOLDEN_STATS: [&str; 19] = [
+    "ratelimit.service.config_fingerprint.d.FINGERPRINT",
+    "ratelimit.service.config_load_success",
+    "ratelimit.service.rate_limit.d.bucket~rate.near_limit",
+    "ratelimit.service.rate_limit.d.bucket~rate.total_capped_hits",
+    "ratelimit.service.rate_limit.d.bucket~rate.total_hits",
+    "ratelimit.service.rate_limit.d.bucket~rate.within_limit",
+    "ratelimit.service.rate_limit.d.fixed~week.near_limit",
+    "ratelimit.service.rate_limit.d.fixed~week.over_limit",
+    "ratelimit.service.rate_limit.d.fixed~week.total_hits",
+    "ratelimit.service.rate_limit.d.fixed~week.total_negative_hits",
+    "ratelimit.service.rate_limit.d.legacy.near_limit",
+    "ratelimit.service.rate_limit.d.legacy.over_limit",
+    "ratelimit.service.rate_limit.d.legacy.total_hits",
+    "ratelimit.service.rate_limit.d.slots~inflight.over_limit",
+    "ratelimit.service.rate_limit.d.slots~inflight.releases_without_slot",
+    "ratelimit.service.rate_limit.d.slots~inflight.slots_acquired",
+    "ratelimit.service.rate_limit.d.slots~inflight.slots_released",
+    "ratelimit.service.rate_limit.d.slots~inflight.total_hits",
+    "ratelimit.service.rate_limit.d.slots~inflight.within_limit",
+];
+/// Stats no decision above produces.
+const GOLDEN_OTHER_STATS: [&str; 7] = [
+    "ratelimit_server.ShouldRateLimit.total_requests",
+    "ratelimit_server.ShouldRateLimit.response_time",
+    "ratelimit.service.call.should_rate_limit.redis_error",
+    "ratelimit.quota_lookup.total_requests",
+    "ratelimit.quota_lookup.error.backend",
+    "ratelimit.quota_lookup.response_time",
+    "ratelimit.redis_pool.cx_active",
+];
+const GOLDEN_METRICS: [&str; 18] = [
+    "ratelimit.quota_lookup.total_requests unmapped",
+    "ratelimit.redis_pool.cx_active unmapped",
+    "ratelimit.service.rate_limit.d.fixed~week.total_negative_hits unmapped",
+    "ratelimit_quota_lookup_errors",
+    "ratelimit_quota_lookup_response_time_seconds",
+    "ratelimit_service_config_fingerprint",
+    "ratelimit_service_config_load_success",
+    "ratelimit_service_rate_limit_near_limit",
+    "ratelimit_service_rate_limit_over_limit",
+    "ratelimit_service_rate_limit_releases_without_slot",
+    "ratelimit_service_rate_limit_slots_acquired",
+    "ratelimit_service_rate_limit_slots_released",
+    "ratelimit_service_rate_limit_total_capped_hits",
+    "ratelimit_service_rate_limit_total_hits",
+    "ratelimit_service_rate_limit_within_limit",
+    "ratelimit_service_response_time_seconds",
+    "ratelimit_service_should_rate_limit_error",
+    "ratelimit_service_total_requests",
+];
+
 /// `LIMIT_PER_UNIT_HEADERS_ENABLED` describes every limit of every list, a window of several
 /// units under its own name (D13); `RateLimit-Reset` is the representative's window's,
 /// offset included, re-read from the clock.
