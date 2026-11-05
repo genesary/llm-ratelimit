@@ -15566,6 +15566,246 @@ descriptors:
     assert_eq!(h.subject.stats.gauges().get(gauge), Some(&1));
 }
 
+/// A stand-in for vLLM answering with usage by model: `cached` reports cached tokens, `null` a
+/// null count as some versions do, `plain` no details, and `streamed` the same as `cached` in
+/// the stream's last chunk.
+async fn llm_usage_stand_in() -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let body_start = loop {
+                    let Ok(n) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(at) = text.find("\r\n\r\n") {
+                        let length = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|v| v.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= at + 4 + length {
+                            break at + 4;
+                        }
+                    }
+                };
+                let body = String::from_utf8_lossy(&request[body_start..]).into_owned();
+                let details = |cached: &str| {
+                    format!(
+                        r#""usage":{{"prompt_tokens":1000,"completion_tokens":100,"total_tokens":1100{cached}}}"#
+                    )
+                };
+                let with_cache = details(r#","prompt_tokens_details":{"cached_tokens":800}"#);
+                if body.contains("\"model\":\"streamed\"") {
+                    let chunks = format!(
+                        "data: {{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"hi\"}}}}]}}\n\ndata: {{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],{with_cache}}}\n\ndata: [DONE]\n\n"
+                    );
+                    let answer = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{chunks}",
+                        chunks.len()
+                    );
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                    return;
+                }
+                let usage = if body.contains("\"model\":\"null\"") {
+                    details(r#","prompt_tokens_details":{"cached_tokens":null}"#)
+                } else if body.contains("\"model\":\"plain\"") {
+                    details("")
+                } else {
+                    with_cache
+                };
+                let json = format!(
+                    r#"{{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{{"index":0,"message":{{"role":"assistant","content":"hi"}},"finish_reason":"stop"}}],{usage}}}"#
+                );
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+                let _ = stream.write_all(answer.as_bytes()).await;
+            });
+        }
+    });
+    port
+}
+
+/// With a real agentgateway (`RATELIMIT_AGENTGATEWAY=<path>`), the `cost` of
+/// `docs/examples/agentgateway.md` counts cached input at a tenth and output at 4, a null or
+/// absent cached count as none, in a stream too; an expression that fails skips its
+/// descriptor, so nothing is counted for it.
+#[tokio::test]
+async fn a_real_agentgateway_weighs_tokens_by_the_cache() {
+    let Ok(agentgateway) = std::env::var("RATELIMIT_AGENTGATEWAY") else {
+        return;
+    };
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("agentgateway-cost");
+    let limits = "domain: llm
+descriptors:
+  - key: weighted
+    rate_limits:
+      - {name: week, requests_per_unit: 1000000, window: {type: fixed, duration: 7d}}
+  - key: failing
+    rate_limits:
+      - {name: week, requests_per_unit: 1000000, window: {type: fixed, duration: 7d}}
+  - key: negative
+    rate_limits:
+      - {name: week, requests_per_unit: 1000000, window: {type: fixed, duration: 7d}}
+";
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", limits.as_bytes()),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    let service = Service::start(
+        std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+        &binary_environment(&runtime, &redis),
+    )
+    .await;
+    service.client().await;
+    let rls = service.grpc.trim_start_matches("http://").to_string();
+    let llm = llm_usage_stand_in().await;
+    let (llm_port, admin, stats, ready) = (
+        reserved_port(),
+        reserved_port(),
+        reserved_port(),
+        reserved_port(),
+    );
+    let model = |name: &str| {
+        format!(
+            "  - name: {name}
+    provider:
+      custom:
+        formats:
+        - type: completions
+    params:
+      baseUrl: http://127.0.0.1:{llm}/v1
+      model: {name}
+"
+        )
+    };
+    let config = format!(
+        "config:
+  adminAddr: 127.0.0.1:{admin}
+  statsAddr: 127.0.0.1:{stats}
+  readinessAddr: 127.0.0.1:{ready}
+llm:
+  port: {llm_port}
+  policies:
+    remoteRateLimit:
+      domain: llm
+      host: {rls}
+      descriptors:
+      - entries:
+        - key: weighted
+          value: llm.requestModel
+        type: tokens
+        cost: >-
+          int(default(llm.inputTokens, 0)) - int(default(llm.cachedInputTokens, 0))
+          + int(default(llm.cachedInputTokens, 0)) / 10
+          + 4 * int(default(llm.outputTokens, 0))
+      - entries:
+        - key: failing
+          value: llm.requestModel
+        type: tokens
+        cost: llm.noSuchField + 1
+      - entries:
+        - key: negative
+          value: llm.requestModel
+        type: tokens
+        cost: 0 - 1
+  models:
+{}{}{}{}",
+        model("cached"),
+        model("null"),
+        model("plain"),
+        model("streamed")
+    );
+    let path = runtime.join("agentgateway.yaml");
+    std::fs::write(&path, config).unwrap();
+    let mut gateway = Command::new(&agentgateway)
+        .arg("-f")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start agentgateway");
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", llm_port))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(gateway.try_wait().unwrap().is_none(), "agentgateway exited");
+    let address = format!("127.0.0.1:{llm_port}");
+    let chat = |name: &str, stream: bool| {
+        let options = if stream {
+            r#","stream_options":{"include_usage":true}"#
+        } else {
+            ""
+        };
+        let body = format!(
+            r#"{{"model":"{name}","stream":{stream}{options},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: llm\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    for (name, stream) in [
+        ("cached", false),
+        ("null", false),
+        ("plain", false),
+        ("streamed", true),
+    ] {
+        let answer = send_raw(&address, &chat(name, stream)).await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{name}: {answer}");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let counted: BTreeMap<String, String> = redis
+        .dump()
+        .await
+        .into_iter()
+        .map(|(key, (value, _))| (key, value))
+        .collect();
+    let of = |prefix: &str, name: &str| {
+        let wanted = format!("{{llm_{prefix}_{name}_}}");
+        counted
+            .iter()
+            .find(|(key, _)| key.starts_with(&wanted))
+            .map(|(_, value)| value.as_str())
+    };
+    // 1000 of input, 800 of them cached, and 100 of output: 200 + 80 + 400.
+    assert_eq!(of("weighted", "cached"), Some("680"), "{counted:?}");
+    assert_eq!(of("weighted", "streamed"), Some("680"), "{counted:?}");
+    // No count of cached tokens: all of it counts as fresh, 1000 + 400.
+    assert_eq!(of("weighted", "null"), Some("1400"), "{counted:?}");
+    assert_eq!(of("weighted", "plain"), Some("1400"), "{counted:?}");
+    // The check's 0 hits create the key; an expression that fails adds nothing to it.
+    assert_eq!(of("failing", "cached"), Some("0"), "{counted:?}");
+    assert_eq!(of("negative", "cached"), Some("0"), "{counted:?}");
+}
+
 /// `LIMIT_PER_UNIT_HEADERS_ENABLED` describes every limit of every list, a window of several
 /// units under its own name (D13); `RateLimit-Reset` is the representative's window's,
 /// offset included, re-read from the clock.
