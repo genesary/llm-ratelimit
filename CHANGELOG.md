@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Added
 
 - The image is also tagged with a `v`, like the git tag: `v0.1.0` and `v0.1` next to `0.1.0` and `0.1`.
+- ADR 0005 proposes limits adapting to load; nothing is built.
 - A fingerprint of each loaded config, in a gauge, `/rlconfig` and the log, to alert on instances that diverge.
 - The agentgateway guide shows how to weigh tokens by the cache, in "Counting like Claude".
 - `token_bucket` windows refill continuously, with `burst` and `max_debt`.

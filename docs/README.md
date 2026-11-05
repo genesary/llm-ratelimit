@@ -19,5 +19,5 @@
 
 - [Design](design.md): the goal and every design decision (D1–D34), with the build order.
 - [Parity](parity.md): what is proven against envoyproxy/ratelimit and by which test, the deliberate divergences (§7), and the extensions (§8).
-- [Architecture decision records](adr/): storage keys, the origin of fixed windows, the quota lookup.
+- [Architecture decision records](adr/): storage keys, the origin of fixed windows, the quota lookup, `concurrency` windows, and a proposal for limits adapting to load.
 - [Glossary](../GLOSSARY.md): the words used across the docs and the code.
