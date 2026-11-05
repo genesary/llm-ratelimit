@@ -297,6 +297,38 @@ kubectl -n envoy-gateway-system rollout restart deployment/envoy-gateway
 - **What Envoy Gateway sends:** it generates the configuration from its own API, so `rate_limits:` lists and the quota lookup are not reachable through it. It runs this service as upstream's, with upstream's features.
 - **Checking the swap:** the rate limit pod in `envoy-gateway-system` runs the new image, and its debug port's `/rlconfig` lists the policy's limits.
 
+## Several instances, one Valkey
+
+One service per workspace, all on one Redis or Valkey, gives a user the same quotas in every workspace: the counters are in the server, and instances hold nothing a request depends on (the [local cache](backends.md#the-local-cache) excepted). A [`concurrency`](configuration.md#concurrency) slot taken through one instance can be released through another.
+
+**What must be the same on every instance**, since it decides a key or what a key means:
+
+- `CACHE_KEY_PREFIX`;
+- the domain and the descriptors: their keys, and which values they match;
+- each limit's `name` and window: type, duration, offset, rounding, and `requests_per_unit`, `lease`;
+- `EXPIRATION_JITTER_MAX_SECONDS`, `USE_CALENDAR_MONTH_RATE_LIMIT`, `NEAR_LIMIT_RATIO`.
+
+Keep the [local cache](backends.md#the-local-cache) off: it holds what one instance saw, for a window.
+
+**If they differ.**
+
+| What differs | What happens |
+|---|---|
+| A key's part (`CACHE_KEY_PREFIX`, the domain, a window's duration or offset, a limit's name) | Different keys: the instances count apart, so a user gets each instance's quota. |
+| `requests_per_unit` | One key, two thresholds: the same counter is judged differently, depending on the workspace. |
+| A `concurrency` limit's `lease` | One key: each operation purges by its own instance's lease, so the shortest lease wins. |
+| A `concurrency` limit's `requests_per_unit` | One key: an instance with the higher limit takes slots past the other's, which then refuses. |
+
+**`failureMode` when Valkey is the single point of failure.** agentgateway decides what happens when the service answers an error.
+
+| | `failClosed` (the default) | `failOpen` |
+|---|---|---|
+| Valkey down | Every LLM request fails with a 500: an outage for all workspaces. | Requests pass, unlimited. |
+| Quotas | Never exceeded. | Not enforced during the outage. |
+| Concurrency windows | A failed check never reaches the model, but amendments lost during the outage orphan their slots until their lease. | Amendments lost during the outage orphan their slots too. And the amendment after a failed check still releases a slot that was never acquired. That slot may be another request's, so admission can exceed the limit for a while, and `releases_without_slot` counts what found nothing. |
+
+Choose with what an outage costs in mind. For a shared model pool, `failOpen` keeps users working, and the scheduler in front of the model still protects it.
+
 ## Replacing upstream's image
 
 Change only the image, from `envoyproxy/ratelimit:<tag>` to `ghcr.io/genesary/ratelimit:<version>`, and keep the variables, the YAML files, the mounts and the probes:

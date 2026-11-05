@@ -3,7 +3,8 @@
 //! Counting them is in `differential.rs` (which runs a Redis), next to upstream's limits.
 
 use ratelimit::config::window::{
-    Anchored, AnchoredOp, AnchoredResult, AnchoredWindow, FixedWindow, OpenOn, Origin, Window,
+    Anchored, AnchoredOp, AnchoredResult, AnchoredWindow, ConcurrencyWindow, FixedWindow, OpenOn,
+    Origin, SlotOp, SlotResult, Window,
 };
 use ratelimit::config::{self, ConfigFile, LimitLookup, LoadOptions, RateLimit};
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
@@ -522,6 +523,171 @@ fn invalid_anchored_windows_are_refused() {
             .err()
             .map(|e| e.to_string()),
         error("only fixed windows can be counted on Memcached")
+    );
+}
+
+/// A `concurrency` window takes a lease, required, and a `retry_after` of at least a second; it
+/// is alone in its list, not in quota mode, and refused on Memcached (D35, ADR 0004).
+#[test]
+fn concurrency_windows_load_as_adr_0004_says() {
+    let limits = list(
+        &with_window("{type: concurrency, lease: 10m, retry_after: 2s}"),
+        &[("user", "alice")],
+    );
+    assert_eq!(
+        limits[0].window,
+        Some(Window::Concurrency(ConcurrencyWindow {
+            lease: 600,
+            retry_after: 2
+        }))
+    );
+    assert_eq!(limits[0].window.unwrap().shape(), "cc");
+    let limits = list(
+        &with_window("{type: concurrency, lease: 30s}"),
+        &[("user", "alice")],
+    );
+    assert_eq!(
+        limits[0].window,
+        Some(Window::Concurrency(ConcurrencyWindow {
+            lease: 30,
+            retry_after: 1
+        }))
+    );
+    let refused = |w: &str| load(&with_window(w)).err();
+    let error = |message: &str| Some(format!("config.yaml: d.user~w: {message}"));
+    for (window, message) in [
+        ("{type: concurrency}", "lease is required"),
+        ("{type: concurrency, lease: 0s}", "invalid lease '0s'"),
+        ("{type: concurrency, lease: soon}", "invalid lease 'soon'"),
+        (
+            "{type: concurrency, lease: 1m, retry_after: 0s}",
+            "invalid retry_after '0s'",
+        ),
+        (
+            "{type: concurrency, lease: 1m, duration: 1h}",
+            "duration is not for concurrency windows",
+        ),
+        (
+            "{type: concurrency, lease: 1m, offset: 1h}",
+            "offset is not for concurrency windows",
+        ),
+        (
+            "{type: fixed, duration: 1h, lease: 1m}",
+            "lease is for concurrency windows",
+        ),
+        (
+            "{type: anchored, duration: 1h, retry_after: 1s}",
+            "retry_after is for concurrency windows",
+        ),
+    ] {
+        assert_eq!(refused(window), error(message), "{window}");
+    }
+    let alone = "domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: slots, requests_per_unit: 1, window: {type: concurrency, lease: 1m}}
+      - {name: w, requests_per_unit: 1, window: {type: fixed, duration: 1h}}
+";
+    assert_eq!(
+        load(alone).err(),
+        Some(
+            "config.yaml: d.user~slots: a concurrency limit must be alone in its rate_limits: hits release its slots"
+                .to_string()
+        )
+    );
+    let quota = with_window("{type: concurrency, lease: 1m}").replacen(
+        "rate_limits:",
+        "quota_mode: true\n    rate_limits:",
+        1,
+    );
+    assert_eq!(
+        load(&quota).err(),
+        error("a concurrency limit cannot be in quota_mode")
+    );
+    let file = ConfigFile {
+        name: "config.yaml".into(),
+        content: with_window("{type: concurrency, lease: 1m}"),
+    };
+    let memcached = LoadOptions {
+        memcached: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        config::load(&[file], &memcached)
+            .err()
+            .map(|e| e.to_string()),
+        error("only fixed windows can be counted on Memcached")
+    );
+}
+
+/// A slot ends at its lease, whatever else happens; a release takes the newest and stops at
+/// nothing left; a forced acquisition goes past the maximum.
+#[test]
+fn slots_step_as_d35_says() {
+    let window = ConcurrencyWindow {
+        lease: 100,
+        retry_after: 1,
+    };
+    let mut slots = Vec::new();
+    let acquire = SlotOp::Acquire {
+        max: 2,
+        force: false,
+    };
+    let result = |acquired, released, expired, in_flight| SlotResult {
+        acquired,
+        released,
+        expired,
+        in_flight,
+    };
+    assert_eq!(
+        window.step(&mut slots, acquire, 1000),
+        result(true, 0, 0, 1)
+    );
+    assert_eq!(
+        window.step(&mut slots, acquire, 1050),
+        result(true, 0, 0, 2)
+    );
+    assert_eq!(
+        window.step(&mut slots, acquire, 1060),
+        result(false, 0, 0, 2)
+    );
+    assert_eq!(
+        window.step(
+            &mut slots,
+            SlotOp::Acquire {
+                max: 2,
+                force: true
+            },
+            1060
+        ),
+        result(true, 0, 0, 3)
+    );
+    // The newest go first: the one acquired at 1000 stays.
+    assert_eq!(
+        window.step(&mut slots, SlotOp::Release(2), 1070),
+        result(false, 2, 0, 1)
+    );
+    assert_eq!(slots, [1000]);
+    // Its lease ends when its age reaches it, before the operation counts.
+    assert_eq!(
+        window.step(&mut slots, SlotOp::Release(1), 1099),
+        result(false, 1, 0, 0)
+    );
+    window.step(&mut slots, acquire, 1100);
+    assert_eq!(
+        window.step(&mut slots, SlotOp::Release(5), 1200),
+        result(false, 0, 1, 0)
+    );
+    // A slot of its own, by when it was acquired.
+    window.step(&mut slots, acquire, 1300);
+    assert_eq!(
+        window.step(&mut slots, SlotOp::Remove(1300), 1301),
+        result(false, 1, 0, 0)
+    );
+    assert_eq!(
+        window.step(&mut slots, SlotOp::Remove(1300), 1301),
+        result(false, 0, 0, 0)
     );
 }
 

@@ -22,6 +22,7 @@ use ratelimit::stats::{
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
     RateLimitDescriptor, rate_limit_descriptor::Entry,
 };
+use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::Code;
 use ratelimit_proto::envoy::service::ratelimit::v3::{
     RateLimitRequest, RateLimitResponse, rate_limit_service_client::RateLimitServiceClient,
 };
@@ -13976,6 +13977,866 @@ async fn anchored_windows_stay_out_of_the_local_cache() {
             "ratelimit.service.rate_limit.d.user~five_hour.over_limit_with_local_cache"
         )
     );
+}
+
+const CONCURRENT: &str = "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: session, requests_per_unit: 3, window: {type: anchored, duration: 5h}}
+  - key: inflight
+    descriptors:
+      - key: model
+        rate_limits:
+          - {name: slots, requests_per_unit: 2, window: {type: concurrency, lease: 10m, retry_after: 2s}}
+  - key: pool
+    rate_limits:
+      - {name: all, requests_per_unit: 1, window: {type: concurrency, lease: 10m}}
+";
+
+/// The descriptor of `user`'s slots on model `m`.
+const ALICE_SLOTS: &[&[(&str, &str)]] = &[&[("inflight", "alice"), ("model", "m")]];
+const ALICE_KEY: &str = "{d_inflight_alice_model_m_}_cc_slots";
+
+/// How many slots a concurrency window's `key` holds, its expired ones included.
+async fn slots_held(redis: &Redis, key: &str) -> String {
+    let reply = resp_command(&redis.address, &["ZCARD", key]).await;
+    reply.trim().trim_start_matches(':').to_string()
+}
+
+/// A check takes a slot up to the limit, then `OVER_LIMIT` with `retry_after`; an amendment or
+/// a refund gives slots back, floored at 0 (D35).
+#[tokio::test]
+async fn concurrency_windows_take_and_give_back_slots() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(CONCURRENT, Settings::default()).await;
+    h.at(1_000_000_000);
+    let check = || hits(ALICE_SLOTS, 0);
+    assert_eq!(h.statuses(check()).await, owned([("Ok", "slots", 1, 2)]));
+    assert_eq!(h.statuses(check()).await, owned([("Ok", "slots", 0, 2)]));
+    assert_eq!(
+        h.statuses(check()).await,
+        owned([("OverLimit", "slots", 0, 2)])
+    );
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "2");
+    // An amendment of cost 1 frees one, which the next check takes.
+    assert_eq!(
+        h.statuses(hits(ALICE_SLOTS, 1)).await,
+        owned([("Ok", "slots", 1, 2)])
+    );
+    assert_eq!(h.statuses(check()).await, owned([("Ok", "slots", 0, 2)]));
+    // A refund is a release; of nothing, it changes nothing.
+    let mut refund = hits(ALICE_SLOTS, 1);
+    refund.descriptors[0].is_negative_hits = true;
+    assert_eq!(
+        h.statuses(refund.clone()).await,
+        owned([("Ok", "slots", 1, 2)])
+    );
+    refund.descriptors[0].hits_addend = Some(0);
+    assert_eq!(h.statuses(refund).await, owned([("Ok", "slots", 1, 2)]));
+    // More than are held: floored, and counted as a client not following the protocol.
+    assert_eq!(
+        h.statuses(hits(ALICE_SLOTS, 5)).await,
+        owned([("Ok", "slots", 2, 2)])
+    );
+    let stats = h.stats();
+    let stat = |name: &str| {
+        stats
+            .get(&format!(
+                "ratelimit.service.rate_limit.d.inflight.model~slots.{name}"
+            ))
+            .copied()
+    };
+    assert_eq!(stat("slots_acquired"), Some(3));
+    assert_eq!(stat("slots_released"), Some(3));
+    assert_eq!(stat("releases_without_slot"), Some(4));
+    assert_eq!(stat("slots_expired"), None);
+    assert_eq!(stat("total_hits"), Some(4));
+    assert_eq!(stat("within_limit"), Some(3));
+    assert_eq!(stat("over_limit"), Some(1));
+    // The set is gone with its last slot, and it expires after its lease otherwise.
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "0");
+    h.call(check()).await;
+    let ttl = resp_command(&h.redis.address, &["TTL", ALICE_KEY]).await;
+    let ttl: i64 = ttl.trim().trim_start_matches(':').parse().unwrap();
+    assert!((655..=660).contains(&ttl), "{ttl}");
+}
+
+/// A slot ends with its lease, whichever request's operation finds it (D35). A release takes
+/// the newest slot, so that an orphan keeps its age: with the oldest taken, each release would
+/// leave a fresher stamp, and under steady traffic the excess would never expire.
+#[tokio::test]
+async fn slots_end_with_their_lease_and_releases_take_the_newest() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(CONCURRENT, Settings::default()).await;
+    let check = || hits(ALICE_SLOTS, 0);
+    // An orphan, then a request that gets its amendment.
+    h.at(1_000_000_000);
+    h.call(check()).await;
+    h.at(1_000_000_100);
+    h.call(check()).await;
+    h.call(hits(ALICE_SLOTS, 1)).await;
+    // The orphan's lease is not over a second before its end.
+    h.at(1_000_000_599);
+    assert_eq!(h.statuses(check()).await, owned([("Ok", "slots", 0, 2)]));
+    h.call(hits(ALICE_SLOTS, 1)).await;
+    h.at(1_000_000_600);
+    assert_eq!(h.statuses(check()).await, owned([("Ok", "slots", 1, 2)]));
+    let stats = h.stats();
+    assert_eq!(
+        stats["ratelimit.service.rate_limit.d.inflight.model~slots.slots_expired"],
+        1
+    );
+}
+
+/// No slot stays held for a request that another limit denies: no amendment will come for it
+/// (ADR 0004).
+#[tokio::test]
+async fn a_request_denied_by_another_limit_holds_no_slot() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(CONCURRENT, Settings::default()).await;
+    h.at(1_000_000_000);
+    let both: &[&[(&str, &str)]] = &[
+        &[("user", "alice")],
+        &[("inflight", "alice"), ("model", "m")],
+    ];
+    // The session is over.
+    h.call(hits(&both[..1], 4)).await;
+    let response = h.call(hits(both, 0)).await;
+    assert_eq!(response.overall_code(), Code::OverLimit);
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "0");
+    assert!(
+        !h.stats()
+            .contains_key("ratelimit.service.rate_limit.d.inflight.model~slots.slots_acquired")
+    );
+    // Its status says what is free, without taking anything.
+    assert_eq!(response.statuses[1].code(), Code::Ok);
+    assert_eq!(response.statuses[1].limit_remaining, 2);
+    // The amendment of an earlier request still releases, whatever the session says.
+    h.call(hits(ALICE_SLOTS, 0)).await;
+    let amendment = h.call(hits(both, 1)).await;
+    assert_eq!(amendment.overall_code(), Code::OverLimit);
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "0");
+}
+
+/// Slots taken for a request that another concurrency limit denies are given back, with their
+/// own identifiers: another request's slot is left alone (ADR 0004).
+#[tokio::test]
+async fn slots_are_given_back_when_another_concurrency_limit_denies() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(CONCURRENT, Settings::default()).await;
+    h.at(1_000_000_000);
+    let pool: &[&[(&str, &str)]] = &[&[("pool", "gpu")]];
+    let both: &[&[(&str, &str)]] = &[&[("inflight", "alice"), ("model", "m")], &[("pool", "gpu")]];
+    // One slot of alice's another request holds, and the pool full.
+    h.call(hits(ALICE_SLOTS, 0)).await;
+    h.call(hits(pool, 0)).await;
+    let response = h.call(hits(both, 0)).await;
+    assert_eq!(response.overall_code(), Code::OverLimit);
+    assert_eq!(response.statuses[0].code(), Code::Ok);
+    assert_eq!(response.statuses[1].code(), Code::OverLimit);
+    // What it would have left, had it not given its slot back.
+    assert_eq!(response.statuses[0].limit_remaining, 1);
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "1");
+    assert_eq!(slots_held(&h.redis, "{d_pool_gpu_}_cc_all").await, "1");
+    let stats = h.stats();
+    assert_eq!(
+        stats["ratelimit.service.rate_limit.d.inflight.model~slots.slots_released"],
+        1
+    );
+    // Once the pool has room, both are taken.
+    h.call(hits(pool, 1)).await;
+    assert_eq!(h.call(hits(both, 0)).await.overall_code(), Code::Ok);
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "2");
+}
+
+/// The other limits decide as the final decision will: a limit in shadow mode denies nothing,
+/// so the slot is taken; a quota group over denies only when every group is (ADR 0004).
+#[tokio::test]
+async fn slots_follow_shadow_and_quota_modes_of_other_limits() {
+    if !tools_available() {
+        return;
+    }
+    let session = "  - key: user\n    rate_limits:";
+    let both: &[&[(&str, &str)]] = &[
+        &[("user", "alice")],
+        &[("inflight", "alice"), ("model", "m")],
+    ];
+    let shadow = CONCURRENT.replacen(
+        session,
+        "  - key: user\n    shadow_mode: true\n    rate_limits:",
+        1,
+    );
+    let h = Extended::start(&shadow, Settings::default()).await;
+    h.at(1_000_000_000);
+    h.call(hits(&both[..1], 4)).await;
+    assert_eq!(h.call(hits(both, 0)).await.overall_code(), Code::Ok);
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "1");
+
+    let quota = CONCURRENT.replacen(
+        session,
+        "  - key: user\n    quota_mode: true\n    rate_limits:",
+        1,
+    );
+    let h = Extended::start(&quota, Settings::default()).await;
+    h.at(1_000_000_000);
+    h.call(hits(&both[..1], 4)).await;
+    // Its only group is over: denied, no slot.
+    assert_eq!(h.call(hits(both, 0)).await.overall_code(), Code::OverLimit);
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "0");
+    // Another group is within its limit: the request passes, and takes its slot.
+    let groups: &[&[(&str, &str)]] = &[
+        &[("user", "alice")],
+        &[("user", "bob")],
+        &[("inflight", "alice"), ("model", "m")],
+    ];
+    assert_eq!(h.call(hits(groups, 0)).await.overall_code(), Code::Ok);
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "1");
+}
+
+/// A pipeline of checks failing on one key gives its request an error, so no amendment will
+/// come: what it took on the others is released.
+#[tokio::test]
+async fn a_failed_check_holds_no_slot() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(CONCURRENT, Settings::default()).await;
+    h.at(1_000_000_000);
+    resp_command(
+        &h.redis.address,
+        &["SET", "{d_pool_gpu_}_cc_all", "not a set"],
+    )
+    .await;
+    let both: &[&[(&str, &str)]] = &[&[("inflight", "alice"), ("model", "m")], &[("pool", "gpu")]];
+    let answer = h.subject.service.should_rate_limit(&hits(both, 0)).await;
+    assert!(answer.is_err(), "{answer:?}");
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "0");
+}
+
+/// In shadow mode a limit takes slots past its maximum and refuses nothing, as global shadow
+/// mode does (ADR 0004).
+#[tokio::test]
+async fn shadow_mode_takes_slots_past_the_limit() {
+    if !tools_available() {
+        return;
+    }
+    let yaml = CONCURRENT.replace(
+        "      - key: model\n",
+        "      - key: model\n        shadow_mode: true\n",
+    );
+    let h = Extended::start(&yaml, Settings::default()).await;
+    h.at(1_000_000_000);
+    for _ in 0..3 {
+        assert_eq!(h.call(hits(ALICE_SLOTS, 0)).await.overall_code(), Code::Ok);
+    }
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "3");
+    let shadowed = "ratelimit.service.rate_limit.d.inflight.model~slots.shadow_mode";
+    assert_eq!(h.stats()[shadowed], 1);
+
+    let settings = Settings {
+        service: ServiceSettings {
+            global_shadow_mode: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(CONCURRENT, settings).await;
+    h.at(1_000_000_000);
+    let both: &[&[(&str, &str)]] = &[
+        &[("user", "alice")],
+        &[("inflight", "alice"), ("model", "m")],
+    ];
+    // What global shadow mode lets through gets its slot, the session being over or not.
+    h.call(hits(&both[..1], 4)).await;
+    for _ in 0..3 {
+        assert_eq!(h.call(hits(both, 0)).await.overall_code(), Code::Ok);
+    }
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "3");
+}
+
+/// A concurrency limit denies the request whatever `QUOTA_MODE` says, and is refused at load
+/// with a `quota_mode` of its own (ADR 0004). `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`, the
+/// local cache and `REDIS_PERSECOND` change nothing for it.
+#[tokio::test]
+async fn other_settings_leave_concurrency_limits_alone() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        cache: CacheSettings {
+            stop_cache_key_increment_when_overlimit: true,
+            local_cache_size_in_bytes: 1 << 20,
+            ..Default::default()
+        },
+        service: ServiceSettings {
+            global_quota_mode: true,
+            ..Default::default()
+        },
+        per_second: true,
+        ..Default::default()
+    };
+    let short = CONCURRENT.replace("lease: 10m", "lease: 30s");
+    let h = Extended::start(&short, settings).await;
+    h.at(1_000_000_000);
+    for _ in 0..2 {
+        assert_eq!(h.call(hits(ALICE_SLOTS, 0)).await.overall_code(), Code::Ok);
+    }
+    assert_eq!(
+        h.call(hits(ALICE_SLOTS, 0)).await.overall_code(),
+        Code::OverLimit
+    );
+    // On the main Redis, its short lease notwithstanding.
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "2");
+    // Refused, but not remembered in the local cache: a released slot is free at once.
+    h.call(hits(ALICE_SLOTS, 1)).await;
+    assert_eq!(h.call(hits(ALICE_SLOTS, 0)).await.overall_code(), Code::Ok);
+}
+
+/// A model's name with `/`, `.`, `:` and what ADR 0001 escapes gives one key per model, so that
+/// being limited on a model leaves the others free.
+#[tokio::test]
+async fn models_with_any_name_have_slots_of_their_own() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(CONCURRENT, Settings::default()).await;
+    h.at(1_000_000_000);
+    let on = |model: &'static str| [("inflight", "alice"), ("model", model)];
+    let qwen = on("Qwen/Qwen3-32B:v1.5");
+    let escaped = on("org/m%{x}");
+    for _ in 0..3 {
+        h.call(hits(&[&qwen], 0)).await;
+    }
+    assert_eq!(
+        h.call(hits(&[&qwen], 0)).await.overall_code(),
+        Code::OverLimit
+    );
+    assert_eq!(h.call(hits(&[&escaped], 0)).await.overall_code(), Code::Ok);
+    assert_eq!(
+        slots_held(
+            &h.redis,
+            "{d_inflight_alice_model_Qwen/Qwen3-32B:v1.5_}_cc_slots"
+        )
+        .await,
+        "2"
+    );
+    assert_eq!(
+        slots_held(
+            &h.redis,
+            "{d_inflight_alice_model_org/m%25%7Bx%7D_}_cc_slots"
+        )
+        .await,
+        "1"
+    );
+}
+
+/// The quota lookup shows what is in flight, leaving out what has expired, and changes
+/// nothing.
+#[tokio::test]
+async fn quota_lookups_show_slots_in_flight() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(CONCURRENT, Settings::default()).await;
+    h.at(1_000_000_000);
+    h.call(hits(ALICE_SLOTS, 0)).await;
+    let limit = async || {
+        let lookup = h
+            .subject
+            .service
+            .lookup(&request("d", ALICE_SLOTS))
+            .await
+            .unwrap();
+        let rendered: serde_json::Value =
+            serde_json::from_str(&ratelimit::quota::render(&lookup)).unwrap();
+        rendered["descriptors"][0]["limits"][0].clone()
+    };
+    let shown = limit().await;
+    assert_eq!(shown["name"], "slots");
+    assert_eq!(shown["in_flight"], 1);
+    assert_eq!(shown["limit"], 2);
+    assert_eq!(shown["remaining"], 1);
+    assert_eq!(shown["used_pct"], 50.0);
+    assert_eq!(shown["resets_at"], serde_json::Value::Null);
+    assert_eq!(
+        shown["window"],
+        serde_json::json!({"type": "concurrency", "lease_s": 600, "retry_after_s": 2})
+    );
+    h.at(1_000_000_600);
+    assert_eq!(limit().await["in_flight"], 0);
+    // Not purged by the reading: only an operation does.
+    assert_eq!(slots_held(&h.redis, ALICE_KEY).await, "1");
+}
+
+/// A service on a Redis Cluster's `nodes`, with its own clock.
+async fn clustered_service(
+    nodes: &[Redis],
+) -> (Arc<RateLimitService<RedisCache>>, Arc<ManualClock>) {
+    let hosts: Vec<String> = nodes[1..]
+        .iter()
+        .map(|n| format!("node={}", n.address))
+        .collect();
+    let url = format!("redis-cluster://{}?{}", nodes[0].address, hosts.join("&"));
+    let pool = Builder::from_config(Config::from_url(&url).unwrap())
+        .build_pool(1)
+        .unwrap();
+    pool.init().await.unwrap();
+    let clock = Arc::new(ManualClock::default());
+    let stats = Arc::new(Stats::default());
+    let cache = RedisCache::new(pool, clock.clone(), stats.clone(), CacheSettings::default());
+    let service = Arc::new(RateLimitService::new(
+        cache,
+        clock.clone(),
+        stats,
+        ServiceSettings::default(),
+    ));
+    let file = ConfigFile {
+        name: "config.yaml".into(),
+        content: CONCURRENT.into(),
+    };
+    service.set_config(config::load(&[file], &LoadOptions::default()).unwrap());
+    (service, clock)
+}
+
+/// The script decides as [`ConcurrencyWindow::step`] does, over random sequences through three
+/// instances of the service on a Redis Cluster, for keys on several nodes (D32.4). Then, the
+/// clock still, checks and amendments race across the instances: however they interleave,
+/// the maximum holds and no slot is lost.
+#[tokio::test]
+async fn the_concurrency_script_steps_like_the_rust_window_on_a_cluster() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit::config::window::{ConcurrencyWindow, SlotOp};
+    let cluster = RedisCluster::start().await;
+    let instances = [
+        clustered_service(&cluster.nodes).await,
+        clustered_service(&cluster.nodes).await,
+        clustered_service(&cluster.nodes).await,
+    ];
+    let at = |now: i64| {
+        for (_, clock) in &instances {
+            clock.0.store(now, Ordering::SeqCst);
+        }
+    };
+    let window = ConcurrencyWindow {
+        lease: 600,
+        retry_after: 2,
+    };
+    // A fixed-seed LCG: the same sequence each run.
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let models = ["a/b:c", "d.e", "f", "g", "h", "i"];
+    let mut now: i64 = 1_000_000_000;
+    let mut states: Vec<Vec<i64>> = vec![Vec::new(); models.len()];
+    for step in 0..600 {
+        now += match next(10) {
+            0 => 400 + next(400) as i64,
+            1 => -(next(30) as i64),
+            _ => next(120) as i64,
+        };
+        at(now);
+        let which = next(models.len() as u64) as usize;
+        let (service, _) = &instances[next(3) as usize];
+        let (added, refund) = match next(5) {
+            0 | 1 => (0, false),
+            2 | 3 => (1 + next(3), false),
+            _ => (next(3), true),
+        };
+        let mut request = hits(&[&[("inflight", "alice"), ("model", models[which])]], added);
+        request.descriptors[0].is_negative_hits = refund;
+        let op = match added == 0 && !refund {
+            true => SlotOp::Acquire {
+                max: 2,
+                force: false,
+            },
+            false => SlotOp::Release(added),
+        };
+        let expected = window.step(&mut states[which], op, now);
+        let status = service.should_rate_limit(&request).await.unwrap().statuses[0].clone();
+        let refused = matches!(op, SlotOp::Acquire { .. }) && !expected.acquired;
+        assert_eq!(
+            (
+                status.code() == Code::OverLimit,
+                u64::from(status.limit_remaining)
+            ),
+            (
+                refused,
+                match refused {
+                    true => 0,
+                    false => 2u64.saturating_sub(expected.in_flight),
+                }
+            ),
+            "step {step} at {now}: {op:?} on {}",
+            models[which]
+        );
+    }
+    // Far past every lease, so that only the race counts.
+    now += 10_000;
+    at(now);
+    let racing: &[&[(&str, &str)]] = &[&[("inflight", "bob"), ("model", "m")]];
+    let in_flight = async || {
+        let lookup = instances[0]
+            .0
+            .lookup(&request("d", &[&[("inflight", "bob"), ("model", "m")]]))
+            .await
+            .unwrap();
+        let rendered: serde_json::Value =
+            serde_json::from_str(&ratelimit::quota::render(&lookup)).unwrap();
+        rendered["descriptors"][0]["limits"][0]["in_flight"]
+            .as_u64()
+            .unwrap()
+    };
+    let mut held: u64 = 0;
+    for _ in 0..30 {
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..12 {
+            let service = instances[i % 3].0.clone();
+            tasks.spawn(async move {
+                service
+                    .should_rate_limit(&hits(&[&[("inflight", "bob"), ("model", "m")]], 0))
+                    .await
+                    .unwrap()
+                    .overall_code()
+                    == Code::Ok
+            });
+        }
+        let mut granted = 0;
+        while let Some(ok) = tasks.join_next().await {
+            granted += u64::from(ok.unwrap());
+        }
+        held += granted;
+        assert!(held <= 2, "{held} slots of 2");
+        assert_eq!(in_flight().await, held);
+        // A release through another instance than the one that acquired.
+        let release = next(3).min(held);
+        for i in 0..release {
+            instances[((i + 1) % 3) as usize]
+                .0
+                .should_rate_limit(&hits(racing, 1))
+                .await
+                .unwrap();
+        }
+        held -= release;
+        assert_eq!(in_flight().await, held);
+    }
+}
+
+/// Three real services on one Redis: acquisitions and releases through any of them, with
+/// nothing held in an instance's memory, and the misuse guard's stat there too.
+#[tokio::test]
+async fn several_instances_share_one_servers_slots() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("concurrency-instances");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/d.yaml", CONCURRENT.as_bytes()),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_ratelimit"));
+    let environment = binary_environment(&runtime, &redis);
+    let mut services = Vec::new();
+    let mut clients = Vec::new();
+    for _ in 0..3 {
+        let service = Service::start(&binary, &environment).await;
+        clients.push(service.client().await);
+        services.push(service);
+    }
+    let mut ask = async |i: usize, added: u64| {
+        clients[i % 3]
+            .should_rate_limit(hits(ALICE_SLOTS, added))
+            .await
+            .unwrap()
+            .into_inner()
+            .overall_code()
+    };
+    assert_eq!(ask(0, 0).await, Code::Ok);
+    assert_eq!(ask(1, 0).await, Code::Ok);
+    assert_eq!(ask(2, 0).await, Code::OverLimit);
+    // Released through an instance that acquired nothing.
+    assert_eq!(ask(2, 1).await, Code::Ok);
+    assert_eq!(slots_held(&redis, ALICE_KEY).await, "1");
+    assert_eq!(ask(0, 0).await, Code::Ok);
+    assert_eq!(ask(1, 0).await, Code::OverLimit);
+}
+
+/// A stand-in for vLLM, by the request's model: `ok` answers, `unavailable` answers 503 as a flow
+/// control TTL eviction does, `cut` starts a stream and closes it, `held` starts a stream
+/// and keeps it open until the client leaves, `queued` answers nothing until it does.
+async fn llm_stand_in() -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let body_start = loop {
+                    let Ok(n) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(at) = text.find("\r\n\r\n") {
+                        let length = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|v| v.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= at + 4 + length {
+                            break at + 4;
+                        }
+                    }
+                };
+                let body = String::from_utf8_lossy(&request[body_start..]).into_owned();
+                let usage = r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                let chunk = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
+                let stream_head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n",
+                    chunk.len()
+                );
+                if body.contains("\"model\":\"unavailable\"") {
+                    let error = r#"{"error":{"message":"evicted","type":"unavailable"}}"#;
+                    let answer = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{error}",
+                        error.len()
+                    );
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                } else if body.contains("\"model\":\"cut\"") {
+                    let _ = stream.write_all(stream_head.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                } else if body.contains("\"model\":\"queued\"") {
+                    let _ = stream.read(&mut buffer).await;
+                } else if body.contains("\"model\":\"held\"") {
+                    let _ = stream.write_all(stream_head.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    let _ = stream.read(&mut buffer).await;
+                } else {
+                    let answer = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{usage}",
+                        usage.len()
+                    );
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                }
+            });
+        }
+    });
+    port
+}
+
+/// With a real agentgateway (`RATELIMIT_AGENTGATEWAY=<path>`, skipped otherwise), a slot is
+/// taken by the check and released by the amendment after a response, a 503, a cut stream and
+/// a client leaving a stream; the refused request gets its `retry-after` and no amendment.
+/// A transport error or a client leaving before the headers sends no amendment, so the slot
+/// waits for its lease: what `docs/upstream/agentgateway-amend-on-drop.md` proposes to change. Should this test fail on
+/// that assertion, the docs on orphans can be relaxed.
+#[tokio::test]
+async fn a_real_agentgateway_takes_and_releases_slots() {
+    let Ok(agentgateway) = std::env::var("RATELIMIT_AGENTGATEWAY") else {
+        return;
+    };
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("agentgateway-slots");
+    let limits = "domain: llm
+descriptors:
+  - key: inflight
+    descriptors:
+      - key: model
+        rate_limits:
+          - {name: inflight, requests_per_unit: 2, window: {type: concurrency, lease: 10m, retry_after: 7s}}
+";
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", limits.as_bytes()),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    let service = Service::start(
+        std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+        &binary_environment(&runtime, &redis),
+    )
+    .await;
+    service.client().await;
+    let rls = service.grpc.trim_start_matches("http://").to_string();
+    let llm = llm_stand_in().await;
+    // Nothing listens there.
+    let gone = reserved_port();
+    let (llm_port, admin, stats, ready) = (
+        reserved_port(),
+        reserved_port(),
+        reserved_port(),
+        reserved_port(),
+    );
+    let model = |name: &str, port: u16| {
+        format!(
+            "  - name: {name}
+    provider:
+      custom:
+        formats:
+        - type: completions
+    params:
+      baseUrl: http://127.0.0.1:{port}/v1
+      model: {name}
+"
+        )
+    };
+    let config = format!(
+        "config:
+  adminAddr: 127.0.0.1:{admin}
+  statsAddr: 127.0.0.1:{stats}
+  readinessAddr: 127.0.0.1:{ready}
+llm:
+  port: {llm_port}
+  policies:
+    remoteRateLimit:
+      domain: llm
+      host: {rls}
+      descriptors:
+      - entries:
+        - key: inflight
+          value: '\"alice\"'
+        - key: model
+          value: llm.requestModel
+        type: tokens
+        cost: '1'
+  models:
+{}{}{}{}{}{}",
+        model("ok", llm),
+        model("unavailable", llm),
+        model("cut", llm),
+        model("held", llm),
+        model("queued", llm),
+        model("gone", gone)
+    );
+    let path = runtime.join("agentgateway.yaml");
+    std::fs::write(&path, config).unwrap();
+    let mut gateway = Command::new(&agentgateway)
+        .arg("-f")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start agentgateway");
+    let chat = |name: &str, stream: bool| {
+        let body = format!(
+            r#"{{"model":"{name}","stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: llm\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", llm_port))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(gateway.try_wait().unwrap().is_none(), "agentgateway exited");
+    let address = format!("127.0.0.1:{llm_port}");
+    let key = |name: &str| format!("{{llm_inflight_alice_model_{name}_}}_cc_inflight");
+    // The amendment goes after the response: wait for it.
+    let settles_at = async |name: &str, held: &str| {
+        for _ in 0..100 {
+            if slots_held(&redis, &key(name)).await == held {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!(
+            "{name}: {} slots, not {held}",
+            slots_held(&redis, &key(name)).await
+        );
+    };
+    let status = |answer: &str| answer.split(' ').nth(1).unwrap_or_default().to_string();
+    // A response, then a 503 such as a flow control eviction answers: both release.
+    let answer = send_raw(&address, &chat("ok", false)).await;
+    assert_eq!(status(&answer), "200", "{answer}");
+    settles_at("ok", "0").await;
+    let answer = send_raw(&address, &chat("unavailable", false)).await;
+    assert_eq!(status(&answer), "503", "{answer}");
+    settles_at("unavailable", "0").await;
+    // A stream the model cuts releases.
+    let answer = send_raw(&address, &chat("cut", true)).await;
+    assert_eq!(status(&answer), "200", "{answer}");
+    settles_at("cut", "0").await;
+    // Two streams held take the two slots; the third is refused, with no amendment after it.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+        stream
+            .write_all(chat("held", true).as_bytes())
+            .await
+            .unwrap();
+        let mut first = [0u8; 64];
+        let n = stream.read(&mut first).await.unwrap();
+        assert!(first[..n].starts_with(b"HTTP/1.1 200"));
+        held.push(stream);
+    }
+    settles_at("held", "2").await;
+    let answer = send_raw(&address, &chat("held", true)).await;
+    assert_eq!(status(&answer), "429", "{answer}");
+    assert!(
+        answer.to_ascii_lowercase().contains("retry-after: 7"),
+        "{answer}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(slots_held(&redis, &key("held")).await, "2");
+    // Clients leaving their streams release.
+    held.clear();
+    settles_at("held", "0").await;
+    // A transport error sends no amendment: an orphan, until its lease.
+    let answer = send_raw(&address, &chat("gone", false)).await;
+    assert!(status(&answer).starts_with('5'), "{answer}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(slots_held(&redis, &key("gone")).await, "1");
+    // So does a client leaving before the response headers, as when cancelled in a queue.
+    let mut queued = tokio::net::TcpStream::connect(&address).await.unwrap();
+    queued
+        .write_all(chat("queued", true).as_bytes())
+        .await
+        .unwrap();
+    settles_at("queued", "1").await;
+    drop(queued);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(slots_held(&redis, &key("queued")).await, "1");
 }
 
 /// `LIMIT_PER_UNIT_HEADERS_ENABLED` describes every limit of every list, a window of several

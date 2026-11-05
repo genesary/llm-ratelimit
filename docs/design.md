@@ -4,6 +4,7 @@ Reference document for the design decisions, from the design grilling of 2026-10
 
 - [ADR 0001 — Storage keys of `rate_limits:` entries](adr/0001-storage-keys-for-rate-limits-entries.md)
 - [ADR 0002 — Origin of fixed windows (`offset`)](adr/0002-origin-of-fixed-windows.md)
+- [ADR 0004 — `concurrency` windows](adr/0004-concurrency-windows.md)
 
 Compatibility progress is tracked in [`docs/parity.md`](parity.md).
 
@@ -102,6 +103,8 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 
 **D12. `duration_until_reset`** *(amended)*. Computed per type and rounded **up** to the second, because agentgateway truncates `x-ratelimit-reset` (`remoteratelimit.rs:606-610`). Never 0 on a denial. Legacy: reproduce `sec − now % sec`, including the possible 0 at the last second of a calendar month. `fixed` with an offset: `D − (now − φ).rem_euclid(D)`.
 
+**D35. `concurrency` windows** ([ADR 0004](adr/0004-concurrency-windows.md)). A limit on requests in flight, on a dedicated `type: tokens`, `cost: "1"` descriptor: a check with 0 hits acquires a slot, an amendment or refund of N releases N. Slots live in a sorted set, purged after `lease`, which is required; a release takes the newest slot. The request's other limits decide first, and slots acquired for a request another `concurrency` limit denies are removed. Redis only, never in the local cache, alone in its list, no `quota_mode`.
+
 **D13. Reporting the window duration** *(amended)*. The largest standard unit that divides the duration is returned, plus `unit_multiplier` (5h → HOUR×5). This is an **extension**: the Go reference does not know this field, nor does agentgateway (flattened proto, field ignored). Per-unit headers are computed on the **per-limit** expansion, not on the reduced statuses; for a legacy config the output is unchanged (`RateLimit-Limit-Hours`), and the `5Hours` suffix only appears when the multiplier ≠ 1.
 
 ---
@@ -144,7 +147,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 
 ## D. Storage, keys and clock
 
-**D24. Backends.** Redis (Lua scripts for the new types), Memcached (legacy and `fixed`, offset included; `anchored`, `sliding`, `token_bucket` and `strict` are config errors there) and in-memory. Memcached is not atomic (decision on `GET`, asynchronous increment): tests tolerate it. Memcached keys ≤ 250 bytes, without spaces or control characters; otherwise the error is logged and `OK` returned, as upstream.
+**D24. Backends.** Redis (Lua scripts for the new types), Memcached (legacy and `fixed`, offset included; `anchored`, `concurrency`, `sliding`, `token_bucket` and `strict` are config errors there) and in-memory. Memcached is not atomic (decision on `GET`, asynchronous increment): tests tolerate it. Memcached keys ≤ 250 bytes, without spaces or control characters; otherwise the error is logged and `OK` returned, as upstream.
 
 **D25. Keys of the new types** *(amended)*: ADR 0001.
 

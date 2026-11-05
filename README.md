@@ -93,6 +93,7 @@ The extensions are listed in [`docs/parity.md`](docs/parity.md) §8:
 - several named limits per descriptor (`rate_limits:`);
 - `fixed` windows of any duration, with an `offset` (constant, or hashed from the descriptor);
 - `anchored` windows, opened by a request and lasting their duration;
+- `concurrency` windows, limiting the requests in flight;
 - the quota lookup, `POST /quota` ([ADR 0003](docs/adr/0003-quota-lookup.md)).
 
 ## Documentation

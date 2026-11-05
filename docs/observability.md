@@ -53,6 +53,7 @@ All of them count **hits**, not requests. A request counts 1 hit unless it sends
 | `over_limit_with_local_cache` | Hits the [local cache](backends.md) refused without asking the backend. |
 | `shadow_mode` | Over-limit hits let through because the descriptor has `shadow_mode: true`. |
 | `total_negative_hits` | Hits given back by refunds (`is_negative_hits`). |
+| `slots_acquired`, `slots_released`, `slots_expired`, `releases_without_slot` | Only for `concurrency` windows. See [below](#concurrency-windows). |
 | `opened_without_hits` | Only for `anchored` windows: sessions that a denied request opened without counting hits in them. See [configuration.md](configuration.md#anchored). |
 
 An example, for a limit of 3 per minute (near threshold: 2) and four requests of 1 hit:
@@ -66,6 +67,27 @@ An example, for a limit of 3 per minute (near threshold: 2) and four requests of
 
 A `rate_limits:` list has a set of counters for each of its limits, named after the descriptor with `~<name>` appended. In the example above, `user~minute` and `user~hour` each have their own `total_hits`.
 
+
+### Concurrency windows
+
+A [`concurrency` window](configuration.md#concurrency) counts slots. `total_hits`, `within_limit` and `over_limit` count one per slot asked for, since its hits are 0, and `near_limit` is not used.
+
+| Counter | What it counts | What to watch |
+|---|---|---|
+| `slots_acquired` | Slots taken. | |
+| `slots_released` | Slots released: amendments, refunds, and slots taken for a request that ended up denied. | |
+| `slots_expired` | Slots removed because their lease ended, by whichever request found them. A slot still there when its key expires is not counted. | Lost amendments. Compare it to `slots_acquired`: a high share means orphans, or a lease under your long requests. |
+| `releases_without_slot` | Releases with nothing left to release. | It should stay near 0. Occasional ones come from a request that outlived its lease. Many mean a client sends hits on its checks, or `failOpen` released slots never taken. |
+
+They are counters, not a gauge, because a stats key names the descriptor rather than the user, and they sum across instances. What is in flight, for a limit, across instances:
+
+```promql
+sum(ratelimit_service_rate_limit_slots_acquired{limit="inflight"})
+  - sum(ratelimit_service_rate_limit_slots_released{limit="inflight"})
+  - sum(ratelimit_service_rate_limit_slots_expired{limit="inflight"})
+```
+
+This is an estimate that drifts upward: a restart resets an instance's counters, and an orphan whose user goes idle disappears with its key, uncounted. [`/quota`](quota-lookup.md) gives one user's exact figure.
 ### Service
 
 | Stat | Type | What it counts |
@@ -262,6 +284,7 @@ Each stat goes through a statsd_exporter mapper, which turns its name into a Pro
 | `ratelimit_service_rate_limit_over_limit` | same | `over_limit` |
 | `ratelimit_service_rate_limit_shadow_mode` | same | `shadow_mode` |
 | `ratelimit_service_rate_limit_opened_without_hits` | same | `opened_without_hits` (list limits) |
+| `ratelimit_service_rate_limit_slots_acquired`, `…_slots_released`, `…_slots_expired`, `…_releases_without_slot` | same | The [`concurrency`](#concurrency-windows) counters |
 | `ratelimit_service_should_rate_limit_error` | `err_type` (`redis_error`, `service_error`) | `call.should_rate_limit.*` |
 | `ratelimit_service_total_requests` | `grpc_method` | `ratelimit_server.<method>.total_requests` |
 | `ratelimit_service_response_time_seconds` | `grpc_method` | `ratelimit_server.<method>.response_time`, a histogram in seconds |

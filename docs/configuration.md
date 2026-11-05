@@ -491,7 +491,7 @@ As upstream does, a limit's `metadata` is left out of the response when the desc
 A request's descriptor can carry its own limit (`RateLimitDescriptor.limit`: `requests_per_unit`, `unit` and `unit_multiplier`), which Envoy builds from its route configuration. It replaces what the configuration says for that descriptor:
 
 - It applies whenever the domain is configured, even if the descriptor matches no configured descriptor. A request for an unknown domain still gets no limit.
-- It replaces a `rate_limit:` and a [`rate_limits:`](#rate_limits) list alike, by one limit of the unit sent, times its `unit_multiplier`.
+- It replaces a `rate_limit:` and a [`rate_limits:`](#rate_limits) list alike, by one limit of the unit sent, times its `unit_multiplier`, even for a `concurrency` window.
 - None of the configured descriptor's keys apply: no `shadow_mode`, `quota_mode`, `detailed_metric`, `metadata` or `replaces`. It has no name, so it is never replaced.
 - Its stats are named after the request's entries: `domain.key1_value1.key2`, an entry without a value by its key alone.
 - A `unit` of `UNKNOWN` is a gRPC `INVALID_ARGUMENT` error (upstream's process crashes there).
@@ -584,6 +584,58 @@ window: {type: anchored, duration: 5h, open_on: first_hit}
 - **Windows opened without hits:** a request that another limit denies still opens a session with `open_on: check`. Those sessions are counted in the `opened_without_hits` stat. Use `open_on: first_hit` if that is unwanted.
 
 `anchored` windows are counted on Redis only, in one script per request: they are refused at load with `BACKEND_TYPE=memcache`. The local cache never holds them, so Redis is asked every time.
+
+### `concurrency`
+
+A limit on requests in flight rather than on hits over time, to keep one user from flooding a model. `requests_per_unit` is the most requests in flight:
+
+```yaml
+- key: inflight_user
+  descriptors:
+    - key: model
+      rate_limits:
+        - name: inflight
+          requests_per_unit: 8
+          window: {type: concurrency, lease: 10m, retry_after: 2s}
+```
+
+| The request | Effect |
+|---|---|
+| 0 hits | Takes a slot if fewer than `requests_per_unit` are held; otherwise `OVER_LIMIT`. |
+| N > 0 hits | Releases N slots, stopping at none. Always OK. |
+| A refund of N | The same release. |
+
+> **This only works on a descriptor of its own, with `type: tokens` and `cost: "1"` on agentgateway's side,** so that the check has 0 hits and the amendment 1. A client sending hits on its checks (agentgateway's tokenization without a `cost`, or Envoy, which sends 1 hit by default) never takes a slot: its requests release instead, and are counted in `releases_without_slot`. That counter should stay near 0.
+
+- **`lease`** (required, no default): how long a slot lasts without a release. Every operation on the window removes the slots this old. Set it around the p99 of your request durations, and keep it short:
+  - A slot's release can be lost, and the slot then lasts until its lease ([when](examples/agentgateway.md#limiting-requests-in-flight)).
+  - Too long, and a few lost releases lock a user out of the model.
+  - Too short, and a request outlives its slot, which admits up to two too many: one when the slot ends, and one when its late amendment releases another request's slot. With a lease at the p99, that concerns about 1% of requests.
+  - A slot's lease cannot be renewed: nothing is sent during a request.
+- **`retry_after`** (default `1s`, at least `1s`): `duration_until_reset` on every answer, so the `retry-after` of a refusal when no longer limit also refuses.
+- **The limit** is a broad safeguard, not a tight limiter. Leave room above what a user needs, so that a few lost releases refuse nobody. Sharing a pool fairly belongs to the scheduler in front of the model.
+- **`limit_remaining`** is the limit minus the slots held. `current_limit` reports the lease as a unit: `10m` is `MINUTE` with `unit_multiplier: 10`.
+
+**With other limits in the request:** the others decide first, and a request they deny takes no slot, since no release would follow. With several `concurrency` limits, slots taken for a request that one of them refuses are released at once. During that instant, one may refuse another request: a false refusal is possible, an excess is not. A release applies whatever the other limits say.
+
+**With other settings:**
+
+| Setting | Behaviour |
+|---|---|
+| `shadow_mode`, `SHADOW_MODE` | Takes slots past the limit and refuses nothing. The excess counts in `shadow_mode`. |
+| `quota_mode` | Refused at load. `QUOTA_MODE` leaves the limit out of quota groups: its refusal denies the request. |
+| `replaces` | As any list limit: a replaced limit takes and releases nothing. |
+| Other limits in the list | Refused at load: an amendment's tokens would release that many slots. |
+| `overflow` | `envoy` has no effect. |
+| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | No effect. |
+| `REDIS_PERSECOND` | Always on the main Redis. |
+| `BACKEND_TYPE=memcache` | Refused at load: `only fixed windows can be counted on Memcached`. |
+| The local cache | Never holds it. |
+| A client-sent `limit` | Replaces the window, as for any limit: do not send one on this descriptor. |
+
+Several instances can share one Redis: a slot taken through one can be released through another, and nothing is kept in an instance's memory. See [deployment.md](deployment.md#several-instances-one-valkey).
+
+The format is fixed in [ADR 0004](adr/0004-concurrency-windows.md).
 
 ### Durations
 
@@ -685,6 +737,8 @@ Error loading new configuration: config.messaging.yaml: invalid rate limit unit 
 - `replaces should not contain a name of the same rate_limits`
 - `window is required`, `window type is required`, `unknown window type 'x'`
 - `window type 'sliding' is not supported yet`, and the same for `sliding_approx` and `token_bucket`
+- `lease is required`, `invalid lease 'x'`, `invalid retry_after 'x'`, `lease is for concurrency windows`, `duration is not for concurrency windows`, and the same for the other keys
+- `a concurrency limit must be alone in its rate_limits: hits release its slots`, `a concurrency limit cannot be in quota_mode`
 - `window duration is required`, `invalid window duration '1.5h'`
 - `offset '7d' must be shorter than the window duration '7d'`
 - `offset_rounding '5h' must divide the window duration '7d'`, `offset_rounding needs offset: hashed`

@@ -11,6 +11,8 @@ pub enum Window {
     Fixed(FixedWindow),
     /// `type: anchored`.
     Anchored(AnchoredWindow),
+    /// `type: concurrency`.
+    Concurrency(ConcurrencyWindow),
 }
 
 impl Window {
@@ -19,6 +21,7 @@ impl Window {
         match self {
             Window::Fixed(w) => w.duration,
             Window::Anchored(w) => w.duration,
+            Window::Concurrency(w) => w.lease,
         }
     }
 
@@ -27,6 +30,7 @@ impl Window {
         match self {
             Window::Fixed(w) => w.shape(),
             Window::Anchored(w) => w.shape(),
+            Window::Concurrency(_) => "cc".to_string(),
         }
     }
 
@@ -35,6 +39,7 @@ impl Window {
         match self {
             Window::Fixed(w) => w.describe(),
             Window::Anchored(w) => w.describe(),
+            Window::Concurrency(w) => w.describe(),
         }
     }
 
@@ -306,6 +311,80 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, b| {
         (hash ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
+}
+
+/// A `concurrency` window (D35, ADR 0004): a limit on requests in flight, each holding a slot
+/// until it is released or its lease ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConcurrencyWindow {
+    /// `lease`: a slot this old is gone, in seconds.
+    pub lease: i64,
+    /// `retry_after`: `duration_until_reset` on every answer, in seconds.
+    pub retry_after: i64,
+}
+
+/// What a request does to a concurrency window's slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotOp {
+    /// Takes a slot if fewer than `max` are held, or anyway with `force` (shadow mode).
+    Acquire { max: u64, force: bool },
+    /// Gives back this many slots, the newest first.
+    Release(u64),
+    /// Gives back the slot acquired at this time: a denied request's.
+    Remove(i64),
+}
+
+/// What an operation did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SlotResult {
+    pub acquired: bool,
+    pub released: u64,
+    /// Slots gone because their lease ended.
+    pub expired: u64,
+    pub in_flight: u64,
+}
+
+impl ConcurrencyWindow {
+    /// The state after `op` at `now`, `slots` being when each slot was acquired. The Redis
+    /// script ([`crate::redis`]) does the same.
+    pub fn step(&self, slots: &mut Vec<i64>, op: SlotOp, now: i64) -> SlotResult {
+        let before = slots.len();
+        slots.retain(|acquired| *acquired > now - self.lease);
+        let mut result = SlotResult {
+            expired: (before - slots.len()) as u64,
+            ..Default::default()
+        };
+        match op {
+            SlotOp::Acquire { max, force } => {
+                if force || (slots.len() as u64) < max {
+                    slots.push(now);
+                    result.acquired = true;
+                }
+            }
+            SlotOp::Release(count) => {
+                slots.sort_unstable();
+                let released = (slots.len() as u64).min(count);
+                slots.truncate(slots.len() - released as usize);
+                result.released = released;
+            }
+            SlotOp::Remove(acquired) => {
+                if let Some(at) = slots.iter().position(|slot| *slot == acquired) {
+                    slots.swap_remove(at);
+                    result.released = 1;
+                }
+            }
+        }
+        result.in_flight = slots.len() as u64;
+        result
+    }
+
+    /// The window as `/rlconfig` shows it.
+    pub fn describe(&self) -> String {
+        format!(
+            "concurrency lease={}s retry_after={}s",
+            self.lease, self.retry_after
+        )
+    }
 }
 
 /// The longest duration a window may have: the reported multiplier is a `uint32`.

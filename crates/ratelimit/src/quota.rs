@@ -32,6 +32,9 @@ fn limit_entry(limit: &RateLimit, reading: &LimitReading, now: i64) -> Value {
     let window = match &limit.window {
         Some(Window::Fixed(w)) => json!({"type": "fixed", "duration_s": w.duration}),
         Some(Window::Anchored(w)) => json!({"type": "anchored", "duration_s": w.duration}),
+        Some(Window::Concurrency(w)) => {
+            json!({"type": "concurrency", "lease_s": w.lease, "retry_after_s": w.retry_after})
+        }
         None => json!({"type": "unit", "unit": limit.limit.unit().as_str_name()}),
     };
     let mut entry = json!({
@@ -48,6 +51,9 @@ fn limit_entry(limit: &RateLimit, reading: &LimitReading, now: i64) -> Value {
     });
     if let Some(Window::Anchored(_)) = &limit.window {
         entry["open"] = json!(reading.reset.is_some());
+    }
+    if let Some(Window::Concurrency(_)) = &limit.window {
+        entry["in_flight"] = json!(reading.used);
     }
     entry
 }

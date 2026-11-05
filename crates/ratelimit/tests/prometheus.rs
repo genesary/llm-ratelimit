@@ -157,6 +157,10 @@ fn the_default_mapper_labels_list_limits() {
         "within_limit",
         "shadow_mode",
         "opened_without_hits",
+        "slots_acquired",
+        "slots_released",
+        "slots_expired",
+        "releases_without_slot",
     ] {
         let cases = [
             (
