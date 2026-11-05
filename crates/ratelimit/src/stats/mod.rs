@@ -332,6 +332,23 @@ impl Stats {
         }
     }
 
+    /// `config_fingerprint.<domain>.<fingerprint>` at 1, and those no longer true at 0 (D36).
+    /// A config without any flushes what upstream's does.
+    pub fn set_config_fingerprints(&self, fingerprints: &BTreeMap<String, String>) {
+        let prefix = format!("{SERVICE}.config_fingerprint.");
+        let mut gauges = self.gauges.lock().unwrap();
+        for (name, gauge) in gauges.iter() {
+            if name.starts_with(&prefix) {
+                gauge.set(0);
+            }
+        }
+        for (domain, fingerprint) in fingerprints {
+            let domain = sanitize_stat_name(domain);
+            let name = format!("{prefix}{domain}.{fingerprint}{}", self.tags);
+            gauges.entry(name).or_default().set(1);
+        }
+    }
+
     /// `config_load_error`.
     pub fn config_load_error(&self) -> Counter {
         self.service_counter("config_load_error")

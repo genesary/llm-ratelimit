@@ -313,6 +313,13 @@ impl<C: RateLimitCache> RateLimitService<C> {
         };
         self.stats.config_load_success().inc();
         self.stats.set_lasting_lockouts(config.lasting_lockouts());
+        let fingerprints = config.fingerprints();
+        self.stats.set_config_fingerprints(&fingerprints);
+        for (domain, fingerprint) in &fingerprints {
+            crate::log::info(&format!(
+                "Config fingerprint of domain {domain}: {fingerprint}"
+            ));
+        }
         *self.config.write().unwrap() = Some(Arc::new(config));
         crate::log::info("Successfully loaded new configuration");
     }

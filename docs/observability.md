@@ -89,6 +89,32 @@ sum(ratelimit_service_rate_limit_slots_acquired{limit="inflight"})
 ```
 
 This is an estimate that drifts upward: a restart resets an instance's counters, and an orphan whose user goes idle disappears with its key, uncounted. [`/quota`](quota-lookup.md) gives one user's exact figure.
+
+### Configs that diverge
+
+Instances sharing one Redis must apply [the same limits](deployment.md#several-instances-one-valkey). Each domain with a `rate_limits:` list reports a fingerprint of what it loaded, the same for the same keys, windows and thresholds, however they are written. Reordering descriptors leaves it alone; reordering a list's limits, or a descriptor's wildcards, changes it, because that can change an answer:
+
+- in a gauge, `ratelimit.service.config_fingerprint.<domain>.<fingerprint>`, at 1, and at 0 for one replaced by a reload;
+- in `/rlconfig`, as `fingerprint <domain> <fingerprint>`;
+- in a log line at each load, at info level: `Config fingerprint of domain <domain>: <fingerprint>`.
+
+An alert for two instances applying different limits to the same keys:
+
+```yaml
+- alert: RateLimitConfigDiverges
+  expr: count by (domain) (count by (domain, fingerprint) (ratelimit_service_config_fingerprint == 1)) > 1
+  for: 10m     # a rollout goes through this for a moment
+  annotations:
+    summary: "Instances apply different limits to domain {{ $labels.domain }}"
+```
+
+- **Silence is not agreement.** A domain without a list reports nothing, xDS configs included, so an instance that lost its list raises no alert.
+- **Not in the fingerprint:** `metadata`, and the environment: `CACHE_KEY_PREFIX`, `QUOTA_MODE`, `SHADOW_MODE`.
+- **Group by what shares a server.** The rule assumes one Redis per Prometheus scope. With several, add the label that tells them apart, such as `cluster`, or two environments would alert forever.
+- **`EXTRA_TAGS`** puts tags in the stat's name, which the shipped mapper does not match. With tags, map it yourself.
+- **A release changing how a fingerprint is computed** says so in its notes, since instances of two releases then differ.
+
+
 ### Service
 
 | Stat | Type | What it counts |
@@ -286,6 +312,7 @@ Each stat goes through a statsd_exporter mapper, which turns its name into a Pro
 | `ratelimit_service_rate_limit_shadow_mode` | same | `shadow_mode` |
 | `ratelimit_service_rate_limit_opened_without_hits` | same | `opened_without_hits` (list limits) |
 | `ratelimit_service_rate_limit_total_capped_hits` | same | `total_capped_hits` |
+| `ratelimit_service_config_fingerprint` | `domain`, `fingerprint` | 1 for what each domain has loaded, 0 for what it had. See [below](#configs-that-diverge). |
 | `ratelimit_service_config_lasting_lockouts` | | Limits in `quota_mode` with `max_debt: unlimited`; absent if there are none |
 | `ratelimit_service_rate_limit_slots_acquired`, `…_slots_released`, `…_slots_expired`, `…_releases_without_slot` | same | The [`concurrency`](#concurrency-windows) counters |
 | `ratelimit_service_should_rate_limit_error` | `err_type` (`redis_error`, `service_error`) | `call.should_rate_limit.*` |

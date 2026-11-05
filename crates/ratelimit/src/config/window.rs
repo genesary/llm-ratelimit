@@ -48,6 +48,20 @@ impl Window {
         }
     }
 
+    /// What decides the window's behaviour under `requests_per_unit`, for the config's
+    /// fingerprint (D36): a default spelled out reads the same.
+    pub fn fingerprint_text(&self, requests_per_unit: u32) -> String {
+        match self {
+            Window::TokenBucket(w) => format!(
+                "token_bucket {}s capacity={} deadline_limit={:?}",
+                w.duration,
+                w.capacity(requests_per_unit),
+                w.deadline_limit(requests_per_unit)
+            ),
+            other => other.describe(),
+        }
+    }
+
     /// The unit the window is reported in, the largest whose length divides the duration,
     /// and how many of them it lasts (D13).
     pub fn unit(&self) -> (Unit, u32) {

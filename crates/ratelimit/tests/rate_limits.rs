@@ -403,12 +403,14 @@ descriptors:
 ",
     )
     .unwrap();
+    let fingerprint = &config.fingerprints()["d"];
     assert_eq!(
         config.dump(),
-        "d.user~a: window=fixed 18000s requests_per_unit=1, shadow_mode: false, quota_mode: false
+        format!("d.user~a: window=fixed 18000s requests_per_unit=1, shadow_mode: false, quota_mode: false
 d.user~b: window=fixed 604800s offset=345600s requests_per_unit=2, shadow_mode: false, quota_mode: false
 d.user~c: window=fixed 86400s offset=hashed/3600s requests_per_unit=3, shadow_mode: false, quota_mode: false
-"
+fingerprint d {fingerprint}
+")
     );
 }
 
@@ -823,6 +825,113 @@ fn token_buckets_step_as_d11_says() {
     };
     let r = free.step(None, op(1000, u64::MAX, false), 1);
     assert_eq!(r.after, MAX_TAT);
+}
+
+const FINGERPRINTED: &str = "domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: session, requests_per_unit: 100, window: {type: anchored, duration: 5h}}
+      - {name: rate, requests_per_unit: 60, window: {type: token_bucket, duration: 60s}}
+  - key: legacy
+    rate_limit: {unit: hour, requests_per_unit: 10}
+";
+
+fn fingerprint(yaml: &str) -> String {
+    load(yaml).unwrap().fingerprints()["d"].clone()
+}
+
+/// Fingerprint of a config: the same for the same limits, however they are written; different
+/// as soon as something that decides keys or answers changes (D36). A value in a release must
+/// not change with it, or instances being upgraded would look like they diverge.
+#[test]
+fn fingerprints_follow_what_decides_and_nothing_else() {
+    let reference = fingerprint(FINGERPRINTED);
+    assert_eq!(reference, "52bac40b4d356bde");
+    // Written otherwise: descriptors' order, comments, spelling, a default made explicit.
+    let rewritten = "# the same limits
+descriptors:
+  - key: legacy
+    rate_limit: {requests_per_unit: 10, unit: HOUR}
+  - rate_limits:
+      - {window: {type: anchored, duration: 300m}, name: session, requests_per_unit: 100}
+      - {requests_per_unit: 60, name: rate, window: {duration: 1m, type: token_bucket, burst: 60, max_debt: 60}}
+    key: user
+domain: d
+";
+    assert_eq!(fingerprint(rewritten), reference);
+    for (from, to) in [
+        ("requests_per_unit: 100", "requests_per_unit: 101"),
+        ("requests_per_unit: 10}", "requests_per_unit: 11}"),
+        ("duration: 5h", "duration: 6h"),
+        ("name: session", "name: other"),
+        ("key: legacy", "key: older"),
+        ("unit: hour", "unit: minute"),
+        ("duration: 60s", "duration: 60s, burst: 30"),
+        ("duration: 60s", "duration: 60s, max_debt: 0"),
+        ("type: anchored, duration: 5h", "type: fixed, duration: 5h"),
+        ("- key: user", "- key: user\n    shadow_mode: true"),
+        ("- key: user", "- key: user\n    quota_mode: true"),
+        ("- key: user", "- key: user\n    detailed_metric: true"),
+        ("- key: user", "- key: user\n    value_to_metric: true"),
+        ("- key: user", "- key: user\n    value: alice"),
+        (
+            "name: session, ",
+            "name: session, replaces: [{name: other}], ",
+        ),
+        ("unit: hour, requests_per_unit: 10", "unlimited: true"),
+        (
+            "type: anchored, duration: 5h",
+            "type: fixed, duration: 5h, offset: 1h",
+        ),
+        (
+            "type: anchored, duration: 5h",
+            "type: fixed, duration: 5h, offset: hashed",
+        ),
+        (
+            "type: anchored, duration: 5h",
+            "type: anchored, duration: 5h, open_on: first_hit",
+        ),
+    ] {
+        let changed = FINGERPRINTED.replace(from, to);
+        assert_ne!(changed, FINGERPRINTED, "{from}");
+        assert_ne!(fingerprint(&changed), reference, "{from} to {to}");
+    }
+    // What depends on order: a list's first limit wins a tie, the first wildcard to match wins.
+    let swapped = |first: &str, second: &str| {
+        fingerprint(&format!(
+            "domain: d\ndescriptors:\n  - key: k\n    rate_limits:\n      - {{name: {first}, requests_per_unit: 1, window: {{type: fixed, duration: 1h}}}}\n      - {{name: {second}, requests_per_unit: 1, window: {{type: fixed, duration: 1h}}}}\n"
+        ))
+    };
+    assert_ne!(swapped("a", "b"), swapped("b", "a"));
+    let wildcards = |first: &str, second: &str| {
+        let limit =
+            "rate_limits: [{name: l, requests_per_unit: 1, window: {type: fixed, duration: 1h}}]";
+        fingerprint(&format!(
+            "domain: d\ndescriptors:\n  - key: k\n    value: {first}\n    {limit}\n  - key: k\n    value: {second}\n    {limit}\n"
+        ))
+    };
+    assert_ne!(wildcards("a*", "ab*"), wildcards("ab*", "a*"));
+    // A shared wildcard, and how deep a limit is.
+    let shared = "domain: d\ndescriptors:\n  - key: k\n    value: a*\n    share_threshold: true\n    rate_limits: [{name: l, requests_per_unit: 1, window: {type: fixed, duration: 1h}}]\n";
+    assert_ne!(
+        fingerprint(shared),
+        fingerprint(&shared.replace("    share_threshold: true\n", ""))
+    );
+    let nested = "domain: d\ndescriptors:\n  - key: a\n    descriptors:\n      - key: b\n        rate_limits: [{name: l, requests_per_unit: 1, window: {type: fixed, duration: 1h}}]\n";
+    let flat = "domain: d\ndescriptors:\n  - key: b\n    rate_limits: [{name: l, requests_per_unit: 1, window: {type: fixed, duration: 1h}}]\n";
+    assert_ne!(fingerprint(nested), fingerprint(flat));
+    // The domain counts: another domain's keys are other keys.
+    assert_ne!(
+        load(&FINGERPRINTED.replace("domain: d", "domain: e"))
+            .unwrap()
+            .fingerprints()["e"],
+        reference
+    );
+    // Upstream's configs, without a list, have none: what they log and flush stays upstream's.
+    let legacy =
+        "domain: d\ndescriptors:\n  - key: k\n    rate_limit: {unit: hour, requests_per_unit: 1}\n";
+    assert!(load(legacy).unwrap().fingerprints().is_empty());
 }
 
 /// D9's opening and counting, in `envoy` mode: what [`AnchoredWindow::step`] does to a state.

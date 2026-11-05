@@ -8723,20 +8723,17 @@ fn pki(dir: &std::path::Path) -> Pki {
     }
 }
 
-/// A fake OTLP collector on `port`: gRPC's `TraceService/Export` (gzip accepted), or HTTP's
+/// A fake OTLP collector on a port it returns: gRPC's `TraceService/Export` (gzip accepted), or HTTP's
 /// `POST /v1/traces` with a protobuf body (gzipped or not); over TLS with `pki`, requiring a
 /// client certificate it issued.
-async fn otlp_collector(
-    port: u16,
-    grpc: bool,
-    pki: Option<&Pki>,
-) -> Arc<std::sync::Mutex<Collected>> {
+async fn otlp_collector(grpc: bool, pki: Option<&Pki>) -> (Arc<std::sync::Mutex<Collected>>, u16) {
     use ratelimit_proto::opentelemetry::proto::collector::trace::v1::{
         ExportTraceServiceRequest, ExportTraceServiceResponse,
         trace_service_server::{TraceService, TraceServiceServer},
     };
     let collected = Arc::new(std::sync::Mutex::new(Collected::default()));
-    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     if grpc {
         struct Collector(Arc<std::sync::Mutex<Collected>>);
         #[tonic::async_trait]
@@ -8873,7 +8870,7 @@ async fn otlp_collector(
             }
         });
     }
-    collected
+    (collected, port)
 }
 
 /// The spans a collector received, comparable across binaries: the resource and schema, then
@@ -9028,9 +9025,8 @@ async fn traces_are_exported_like_upstream() {
             PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
         ] {
             let redis = Redis::start().await;
-            let collector_port = reserved_port();
-            let collected =
-                otlp_collector(collector_port, protocol == "grpc", tls.then_some(&pki)).await;
+            let (collected, collector_port) =
+                otlp_collector(protocol == "grpc", tls.then_some(&pki)).await;
             let scheme = if tls { "https" } else { "http" };
             let (grpc, http) = (reserved_port(), reserved_port());
             let environment = vec![
@@ -13247,8 +13243,7 @@ async fn memcached_calls_are_traced_like_upstream() {
     ] {
         let memcached = Memcached::start().await;
         let statsd = StatsdServer::start().await;
-        let collector_port = reserved_port();
-        let collected = otlp_collector(collector_port, true, None).await;
+        let (collected, collector_port) = otlp_collector(true, None).await;
         let mut environment = memcached_environment(&runtime, &memcached.address, &statsd);
         environment.extend([
             ("TRACING_ENABLED", "true".to_string()),
@@ -15804,6 +15799,82 @@ llm:
     // The check's 0 hits create the key; an expression that fails adds nothing to it.
     assert_eq!(of("failing", "cached"), Some("0"), "{counted:?}");
     assert_eq!(of("negative", "cached"), Some("0"), "{counted:?}");
+}
+
+/// A loaded config's fingerprint is in a gauge per domain, the previous one going to 0 on a
+/// reload, and in a log line at each load (D36).
+#[tokio::test]
+async fn config_fingerprints_are_reported_at_each_load() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(WEEK_AND_FIVE_HOURS, Settings::default()).await;
+    let first = h.subject.service.current_config().unwrap().fingerprints()["d"].clone();
+    let gauge = |fingerprint: &str| format!("ratelimit.service.config_fingerprint.d.{fingerprint}");
+    assert_eq!(h.subject.stats.gauges().get(&gauge(&first)), Some(&1));
+    let file = ConfigFile {
+        name: "config.yaml".into(),
+        content: WEEK_AND_FIVE_HOURS.replace("requests_per_unit: 3", "requests_per_unit: 4"),
+    };
+    h.subject
+        .service
+        .set_config(config::load(&[file], &LoadOptions::default()).unwrap());
+    let second = h.subject.service.current_config().unwrap().fingerprints()["d"].clone();
+    assert_ne!(second, first);
+    let gauges = h.subject.stats.gauges();
+    assert_eq!(gauges.get(&gauge(&first)), Some(&0));
+    assert_eq!(gauges.get(&gauge(&second)), Some(&1));
+    // A config without a list reports nothing, and what it reported goes to 0.
+    let file = ConfigFile {
+        name: "config.yaml".into(),
+        content: "domain: d\ndescriptors:\n  - key: k\n    rate_limit: {unit: hour, requests_per_unit: 1}\n".into(),
+    };
+    h.subject
+        .service
+        .set_config(config::load(&[file], &LoadOptions::default()).unwrap());
+    assert_eq!(h.subject.stats.gauges().get(&gauge(&second)), Some(&0));
+
+    let runtime = temp_dir("config-fingerprint");
+    let yaml = WEEK_AND_FIVE_HOURS.replace("domain: d", "domain: llm");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", yaml.as_bytes()),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    let grpc = reserved_port();
+    let mut environment = binary_environment(&runtime, &redis);
+    environment.extend([
+        ("LOG_LEVEL", "info".to_string()),
+        ("GRPC_HOST", "127.0.0.1".to_string()),
+        ("GRPC_PORT", grpc.to_string()),
+        ("HOST", "127.0.0.1".to_string()),
+        ("PORT", reserved_port().to_string()),
+        ("DEBUG_HOST", "127.0.0.1".to_string()),
+        ("DEBUG_PORT", reserved_port().to_string()),
+    ]);
+    let hash = config::load(
+        &[ConfigFile {
+            name: "llm.yaml".into(),
+            content: yaml.clone(),
+        }],
+        &LoadOptions::default(),
+    )
+    .unwrap()
+    .fingerprints()["llm"]
+        .clone();
+    let stderr = logged_run(
+        std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+        &environment,
+        &format!("http://127.0.0.1:{grpc}"),
+    )
+    .await;
+    assert!(
+        stderr.contains(&format!("Config fingerprint of domain llm: {hash}")),
+        "{stderr}"
+    );
 }
 
 /// `LIMIT_PER_UNIT_HEADERS_ENABLED` describes every limit of every list, a window of several

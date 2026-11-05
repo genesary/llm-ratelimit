@@ -10,7 +10,7 @@ use rate_limit_response::rate_limit::Unit;
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescriptor;
 use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response;
 use schema::YamlDescriptor;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use window::{
     AnchoredWindow, ConcurrencyWindow, FixedWindow, MaxDebt, OpenOn, Origin, TokenBucketWindow,
     Window,
@@ -657,7 +657,58 @@ fn warn_of_token_bucket(
     }
 }
 
+/// A limit's line in the text a fingerprint is taken of (D36).
+fn fingerprint_line(limit: &RateLimit) -> String {
+    let requests = limit.limit.requests_per_unit;
+    let window = limit.window.as_ref().map_or_else(
+        || format!("unit={}", unit_name(limit.limit.unit)),
+        |window| window.fingerprint_text(requests),
+    );
+    let mut replaces = limit.replaces.clone();
+    replaces.sort();
+    format!(
+        "{}~{} {window} requests_per_unit={requests} unlimited={} shadow_mode={} quota_mode={} detailed_metric={} replaces={replaces:?}\n",
+        limit.full_key,
+        limit.name,
+        limit.unlimited,
+        limit.shadow_mode,
+        limit.quota_mode,
+        limit.detailed_metric
+    )
+}
+
 impl Descriptor {
+    /// Its limits, and those under it, sorted where order changes nothing (D36): a list's first
+    /// limit wins a tie, and the first wildcard to match wins.
+    fn fingerprint_text(&self, text: &mut String) {
+        if let Some(limit) = &self.limit {
+            text.push_str(&fingerprint_line(limit));
+        }
+        for limit in &self.list {
+            text.push_str(&fingerprint_line(limit));
+        }
+        for (pattern, _) in &self.wildcards {
+            text.push_str(&format!("wildcard {pattern}\n"));
+        }
+        if let Some(pattern) = &self.share_threshold_pattern {
+            text.push_str(&format!("share_threshold={pattern}\n"));
+        }
+        let mut children: Vec<_> = self.descriptors.iter().collect();
+        children.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, child) in children {
+            text.push_str(&format!(
+                "descriptor {key} value_to_metric={}\n",
+                child.value_to_metric
+            ));
+            child.fingerprint_text(text);
+        }
+    }
+
+    /// Whether it or one under it has a `rate_limits:` list.
+    fn has_list(&self) -> bool {
+        !self.list.is_empty() || self.descriptors.values().any(Descriptor::has_list)
+    }
+
     /// Its limits, and those under it, in `quota_mode` with `max_debt: unlimited` (D19).
     fn lasting_lockouts(&self, global_quota_mode: bool) -> u64 {
         let own = self.list.iter().filter(|limit| {
@@ -754,6 +805,21 @@ impl Descriptor {
 }
 
 impl RateLimitConfig {
+    /// The fingerprint of each domain with a `rate_limits:` list (D36): the same for the same
+    /// keys, windows and thresholds, however they were written or where they came from.
+    pub fn fingerprints(&self) -> BTreeMap<String, String> {
+        self.domains
+            .iter()
+            .filter(|(_, domain)| domain.has_list())
+            .map(|(name, domain)| {
+                let mut text = format!("v1 {name}\n");
+                domain.fingerprint_text(&mut text);
+                let hash = xxhash_rust::xxh64::xxh64(text.as_bytes(), 0);
+                (name.clone(), format!("{hash:016x}"))
+            })
+            .collect()
+    }
+
     /// The limits that can block a quota group for as long as traffic lasts (D19).
     pub fn lasting_lockouts(&self) -> u64 {
         self.domains
@@ -811,6 +877,9 @@ impl RateLimitConfig {
         let mut out = String::new();
         for (_, domain) in domains {
             dump(domain, &mut out);
+        }
+        for (domain, fingerprint) in self.fingerprints() {
+            out.push_str(&format!("fingerprint {domain} {fingerprint}\n"));
         }
         out
     }
