@@ -21,7 +21,7 @@ To replace envoy ratelimit behind Envoy, Envoy Gateway or agentgateway, you only
 
 ### Why not
 
-- It is young (v0.1.0) and has a single maintainer. The upstream project has years of production use.
+- It is young (v0.2.0) and has a single maintainer. The upstream project has years of production use.
 - `sliding` windows and `overflow: strict` are designed but not built yet, and are refused at load.
 - Where this service differs on purpose (where upstream panics, an error at startup or on the request; a stricter TLS check; …), the difference is listed in [`docs/parity.md`](docs/parity.md) §7.
 

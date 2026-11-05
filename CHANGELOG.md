@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-05
+
+The project is now `llm-ratelimit`, at `ghcr.io/genesary/llm-ratelimit`. To replace envoy ratelimit, you still only change the image.
+
 ### Added
 
 - The image is also tagged with a `v`, like the git tag: `v0.1.0` and `v0.1` next to `0.1.0` and `0.1`.
@@ -47,5 +51,6 @@ The first release.
 - **Redis down:** a decision fails at once while every connection is down, so that callers without a deadline (agentgateway) apply their failure mode; upstream holds decisions until the caller's deadline.
 - **Errors instead of panics:** where upstream panics, this service returns an error, at startup or on the request, and TLS checks are stricter. The full list is in `docs/parity.md` §7.
 
-[Unreleased]: https://github.com/genesary/llm-ratelimit/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/genesary/llm-ratelimit/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/genesary/llm-ratelimit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/genesary/llm-ratelimit/releases/tag/v0.1.0
