@@ -5,6 +5,7 @@ Reference document for the design decisions, from the design grilling of 2026-10
 - [ADR 0001 — Storage keys of `rate_limits:` entries](adr/0001-storage-keys-for-rate-limits-entries.md)
 - [ADR 0002 — Origin of fixed windows (`offset`)](adr/0002-origin-of-fixed-windows.md)
 - [ADR 0004 — `concurrency` windows](adr/0004-concurrency-windows.md)
+- [ADR 0005 — Limits adapting to load](adr/0005-limits-adapting-to-load.md) (proposed, not built)
 
 Compatibility progress is tracked in [`docs/parity.md`](parity.md).
 
