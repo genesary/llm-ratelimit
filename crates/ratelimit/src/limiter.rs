@@ -178,6 +178,7 @@ pub(crate) fn reset(
     match &limit.window {
         Some(Window::Fixed(w)) => Ok(w.reset(now, w.phase(key_entries(descriptor, limit)))),
         Some(Window::Anchored(w)) => Ok(w.reset(None, now)),
+        Some(Window::Concurrency(w)) => Ok(w.retry_after),
         None => reset_seconds(limit.limit.unit(), now, calendar),
     }
 }
@@ -195,6 +196,8 @@ pub(crate) fn slots(limits: &[Vec<RateLimit>]) -> impl Iterator<Item = (usize, u
 /// or a list with a window shorter than a minute (D15).
 pub(crate) fn per_second(limits: &[RateLimit]) -> bool {
     limits.iter().any(|limit| match &limit.window {
+        // Its lease says nothing of how often it is asked: on the main Redis.
+        Some(Window::Concurrency(_)) => false,
         Some(window) => window.duration() < 60,
         None => limit.limit.unit() == Unit::Second,
     })
@@ -222,7 +225,12 @@ pub(crate) fn hits(request: &RateLimitRequest) -> Vec<Hits> {
         .collect()
 }
 
-fn status(code: Code, limit: &RateLimit, limit_remaining: u32, reset: i64) -> DescriptorStatus {
+pub(crate) fn status(
+    code: Code,
+    limit: &RateLimit,
+    limit_remaining: u32,
+    reset: i64,
+) -> DescriptorStatus {
     DescriptorStatus {
         code: code as i32,
         current_limit: Some(limit.limit.clone()),

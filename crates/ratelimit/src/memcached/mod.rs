@@ -326,6 +326,7 @@ impl RateLimitCache for MemcacheCache {
             statuses[c.index].push(LimitOutcome {
                 status,
                 opened_without_hits: false,
+                slot_pending: false,
             });
         }
 

@@ -10,15 +10,20 @@ pub mod tls;
 pub use connection::{Connected, RedisConnection, StartupBackoff, Tls, mask_credentials_in_url};
 
 use crate::config::RateLimit;
-use crate::config::window::{Anchored, AnchoredWindow, MAX_ANCHORED_COUNT, OpenOn, Window};
+use crate::config::window::{
+    Anchored, AnchoredWindow, ConcurrencyWindow, MAX_ANCHORED_COUNT, OpenOn, SlotResult, Window,
+};
 use crate::limiter::{self, CacheSettings, Clock, Count, Hits, RequestState};
 use crate::local_cache::LocalCache;
-use crate::service::{CacheError, LimitOutcome, LimitReading, RateLimitCache};
+use crate::service::{
+    CacheError, HeldSlot, LimitOutcome, LimitReading, RateLimitCache, SlotAnswer, SlotCheck,
+};
 use crate::stats::{RateLimitStats, Stats};
 use fred::prelude::*;
 use fred::types::{ClusterHash, CustomCommand};
 use live::LivePool;
 use ratelimit_proto::envoy::service::ratelimit::v3::RateLimitRequest;
+use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::{Code, DescriptorStatus};
 use std::sync::Arc;
 
 /// Upstream's `DecrementScript`, byte for byte: subtract, floor at 0, reset the TTL.
@@ -64,6 +69,33 @@ return {anchor, count, 0}
 
 /// How long an anchored window's key outlives it, for replicas whose clocks are behind.
 const ANCHORED_MARGIN_SECONDS: i64 = 60;
+
+/// A `concurrency` window's slots (docs/design.md D35), as [`ConcurrencyWindow::step`] decides
+/// them: a sorted set of members scored by when they were acquired. ARGV: now, lease, TTL,
+/// then `acquire`, the limit, force (1) or not (0), the member; `release` and how many, the
+/// newest first; or `remove` and the member. Returns whether it acquired, how many it
+/// released, how many leases had ended, and how many slots are left.
+const CONCURRENCY_SCRIPT: &str = "
+local now, lease = tonumber(ARGV[1]), tonumber(ARGV[2])
+local expired = redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - lease)
+local acquired, released = 0, 0
+if ARGV[4] == 'acquire' then
+  if ARGV[6] == '1' or redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[5]) then
+    redis.call('ZADD', KEYS[1], now, ARGV[7])
+    acquired = 1
+  end
+elseif ARGV[4] == 'release' then
+  released = #redis.call('ZPOPMAX', KEYS[1], ARGV[5]) / 2
+else
+  released = redis.call('ZREM', KEYS[1], ARGV[5])
+end
+local in_flight = redis.call('ZCARD', KEYS[1])
+if in_flight > 0 then redis.call('EXPIRE', KEYS[1], ARGV[3]) end
+return {acquired, released, expired, in_flight}
+";
+
+/// How long a concurrency window's key outlives its newest lease.
+const CONCURRENCY_MARGIN_SECONDS: i64 = 60;
 
 pub struct RedisCache {
     /// Connections, each request's pipeline on one of them (radix's pool).
@@ -292,11 +324,17 @@ impl RateLimitCache for RedisCache {
             )?;
             let hits = hits[index];
             let stats = self.stats.rate_limit(&limit.full_key);
-            limiter::count_hits(&stats, hits);
-            // Refunds always reach Redis; the local cache does not hold anchored windows.
+            // A concurrency window's hits are slots, counted when they are decided.
+            let concurrency = matches!(limit.window, Some(Window::Concurrency(_)));
+            if !concurrency {
+                limiter::count_hits(&stats, hits);
+            }
+            // Refunds always reach Redis; the local cache does not hold anchored or concurrency
+            // windows.
             let anchored = matches!(limit.window, Some(Window::Anchored(_)));
             let over_in_local_cache = !hits.refund
                 && !anchored
+                && !concurrency
                 && self
                     .local_cache
                     .as_ref()
@@ -344,9 +382,17 @@ impl RateLimitCache for RedisCache {
             if c.over_in_local_cache {
                 continue;
             }
+            // A check waits for the request's decision (D35).
+            if matches!(c.limit.window, Some(Window::Concurrency(_))) && slot_pending(c.hits) {
+                continue;
+            }
             crate::debug!("looking up cache key: {}", c.key);
             let commands = &mut pipelines[c.pipeline];
             reply_of.push((c.index, c.slot, c.pipeline, commands.len()));
+            if let Some(Window::Concurrency(window)) = &c.limit.window {
+                commands.push(release_command(window, &c.key, c.hits.value, now));
+                continue;
+            }
             // An anchored window's key expires with the window, which the script knows.
             if let Some(Window::Anchored(window)) = &c.limit.window {
                 commands.push(anchored_command(window, &c.key, c.hits, now));
@@ -425,6 +471,12 @@ impl RateLimitCache for RedisCache {
         for (index, slot, pipeline, at) in reply_of {
             let reply = replies[pipeline][at].clone();
             let command = &pipelines[pipeline][at];
+            if let Some(Window::Concurrency(_)) = &limits[index][slot].window {
+                let result = command.slots(reply)?;
+                count_slots(&self.stats, &limits[index][slot], result, hits[index].value);
+                counts[index][slot] = Count::After(result.in_flight);
+                continue;
+            }
             let Some(Window::Anchored(window)) = &limits[index][slot].window else {
                 counts[index][slot] = Count::After(command.counter(reply)?);
                 continue;
@@ -440,7 +492,10 @@ impl RateLimitCache for RedisCache {
             } else if let (false, Count::After(after), Some(cache)) =
                 (c.hits.refund, counts[c.index][c.slot], &self.local_cache)
                 && limiter::exceeds(c.limit, after)
-                && !matches!(c.limit.window, Some(Window::Anchored(_)))
+                && !matches!(
+                    c.limit.window,
+                    Some(Window::Anchored(_) | Window::Concurrency(_))
+                )
             {
                 // Cached for a whole window, shadow rules included, as upstream.
                 let calendar = self.settings.use_calendar_month;
@@ -456,6 +511,20 @@ impl RateLimitCache for RedisCache {
             .map(|list| Vec::with_capacity(list.len()))
             .collect();
         for c in &checks {
+            if let Some(Window::Concurrency(window)) = &c.limit.window {
+                // A release is always OK; a pending check stands for a free slot until then.
+                // The local cache never answers for it.
+                let in_flight = match counts[c.index][c.slot] {
+                    Count::After(in_flight) => in_flight,
+                    Count::OverInLocalCache => 0,
+                };
+                statuses[c.index].push(LimitOutcome {
+                    status: slots_status(c.limit, window, in_flight),
+                    opened_without_hits: false,
+                    slot_pending: slot_pending(c.hits),
+                });
+                continue;
+            }
             let reset = match resets[c.index][c.slot] {
                 Some(reset) => reset,
                 None => {
@@ -470,9 +539,237 @@ impl RateLimitCache for RedisCache {
             statuses[c.index].push(LimitOutcome {
                 status,
                 opened_without_hits: opened_without_hits[c.index][c.slot],
+                slot_pending: false,
             });
         }
         Ok(statuses)
+    }
+
+    async fn check_slots(
+        &self,
+        request: &RateLimitRequest,
+        limits: &[Vec<RateLimit>],
+        checks: &[SlotCheck],
+    ) -> Result<Vec<SlotAnswer>, CacheError> {
+        let now = self.clock.unix_now();
+        let mut commands = Vec::with_capacity(checks.len());
+        let mut pending = Vec::with_capacity(checks.len());
+        for check in checks {
+            let limit = &limits[check.index][check.limit];
+            let Some(Window::Concurrency(window)) = &limit.window else {
+                return Err(CacheError("a slot for a limit without one".into()));
+            };
+            let key = limiter::cache_key(
+                &self.settings.cache_key_prefix,
+                &request.domain,
+                &request.descriptors[check.index],
+                limit,
+                now,
+                self.settings.use_calendar_month,
+            )?;
+            let member = check.acquire.then(new_member);
+            commands.push(match &member {
+                Some(member) => acquire_command(window, &key, limit, check.force, member, now),
+                None => in_flight_command(window, &key, now),
+            });
+            pending.push((check, limit, window, key, member));
+        }
+        let replies = match send(self.pool.next()?, &commands).await {
+            Ok(replies) => replies,
+            Err(e) => {
+                self.release_after_failure(&pending, now).await;
+                return Err(e);
+            }
+        };
+        let mut answers = Vec::with_capacity(checks.len());
+        for (((check, limit, window, key, member), command), reply) in
+            pending.into_iter().zip(&commands).zip(replies)
+        {
+            let Some(member) = member else {
+                answers.push(SlotAnswer {
+                    check: *check,
+                    status: slots_status(limit, window, command.counter(reply)?),
+                    held: None,
+                });
+                continue;
+            };
+            let result = command.slots(reply)?;
+            count_slots(&self.stats, limit, result, 0);
+            let over = !result.acquired || limiter::exceeds(limit, result.in_flight);
+            let stats = self.stats.rate_limit(&limit.full_key);
+            stats.total_hits.add(1);
+            match over {
+                true => stats.over_limit.add(1),
+                false => stats.within_limit.add(1),
+            }
+            if over && result.acquired {
+                stats.shadow_mode.add(1);
+            }
+            let (code, left) = match over {
+                true => (Code::OverLimit, 0),
+                false => (Code::Ok, slots_left(limit, result.in_flight)),
+            };
+            answers.push(SlotAnswer {
+                check: *check,
+                status: limiter::status(code, limit, left, window.retry_after),
+                held: result.acquired.then_some(HeldSlot { key, member }),
+            });
+        }
+        Ok(answers)
+    }
+
+    async fn return_slots(
+        &self,
+        limits: &[Vec<RateLimit>],
+        answers: &[SlotAnswer],
+    ) -> Result<(), CacheError> {
+        let now = self.clock.unix_now();
+        let mut commands = Vec::new();
+        let mut returned = Vec::new();
+        for answer in answers {
+            let limit = &limits[answer.check.index][answer.check.limit];
+            let (Some(held), Some(Window::Concurrency(window))) = (&answer.held, &limit.window)
+            else {
+                continue;
+            };
+            commands.push(remove_command(window, &held.key, &held.member, now));
+            returned.push(limit);
+        }
+        if commands.is_empty() {
+            return Ok(());
+        }
+        let replies = send(self.pool.next()?, &commands).await?;
+        for ((limit, command), reply) in returned.into_iter().zip(&commands).zip(replies) {
+            count_slots(&self.stats, limit, command.slots(reply)?, 0);
+        }
+        Ok(())
+    }
+}
+
+impl RedisCache {
+    /// Releases what a failed pipeline of checks may have taken: its other commands still
+    /// run, and its request gets an error, so no amendment will come. A slot it cannot release
+    /// ends with its lease.
+    async fn release_after_failure(&self, pending: &[PendingSlot<'_>], now: i64) {
+        let commands: Vec<Command> = pending
+            .iter()
+            .filter_map(|(_, _, window, key, member)| {
+                Some(remove_command(window, key, member.as_ref()?, now))
+            })
+            .collect();
+        if commands.is_empty() {
+            return;
+        }
+        let released = match self.pool.next() {
+            Ok(pool) => send(pool, &commands).await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = released {
+            crate::log::error(&format!("Failing to release a slot: {}", e.0));
+        }
+    }
+}
+
+/// A slot being checked: its check, limit and window, its key, and the member it would take.
+type PendingSlot<'a> = (
+    &'a SlotCheck,
+    &'a RateLimit,
+    &'a ConcurrencyWindow,
+    String,
+    Option<String>,
+);
+
+/// An OK status with `in_flight` slots held.
+fn slots_status(limit: &RateLimit, window: &ConcurrencyWindow, in_flight: u64) -> DescriptorStatus {
+    limiter::status(
+        Code::Ok,
+        limit,
+        slots_left(limit, in_flight),
+        window.retry_after,
+    )
+}
+
+/// Whether these hits are a check taking a slot, rather than a release (D35).
+fn slot_pending(hits: Hits) -> bool {
+    hits.value == 0 && !hits.refund
+}
+
+/// What is left of `limit` with `in_flight` slots held.
+fn slots_left(limit: &RateLimit, in_flight: u64) -> u32 {
+    u64::from(limit.limit.requests_per_unit).saturating_sub(in_flight) as u32
+}
+
+/// Counts what a concurrency script did: `asked` slots were to be released.
+fn count_slots(stats: &Stats, limit: &RateLimit, result: SlotResult, asked: u64) {
+    let key = &limit.full_key;
+    let add = |name: &str, count: u64| {
+        if count > 0 {
+            stats.rate_limit_counter(key, name).add(count);
+        }
+    };
+    add("slots_acquired", u64::from(result.acquired));
+    add("slots_released", result.released);
+    add("slots_expired", result.expired);
+    add(
+        "releases_without_slot",
+        asked.saturating_sub(result.released),
+    );
+}
+
+/// A slot's member, unique across instances.
+fn new_member() -> String {
+    let mut bytes = [0u8; 16];
+    crate::random::fill(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The script call with the arguments every concurrency operation starts with.
+fn concurrency_command(window: &ConcurrencyWindow, key: &str, now: i64, op: &[&str]) -> Command {
+    let ttl = window.lease + CONCURRENCY_MARGIN_SECONDS;
+    let mut args = vec![
+        CONCURRENCY_SCRIPT.to_string(),
+        "1".to_string(),
+        key.to_string(),
+        now.to_string(),
+        window.lease.to_string(),
+        ttl.to_string(),
+    ];
+    args.extend(op.iter().map(|part| part.to_string()));
+    Command { name: "EVAL", args }
+}
+
+fn acquire_command(
+    window: &ConcurrencyWindow,
+    key: &str,
+    limit: &RateLimit,
+    force: bool,
+    member: &str,
+    now: i64,
+) -> Command {
+    let max = limit.limit.requests_per_unit.to_string();
+    let force = if force { "1" } else { "0" };
+    concurrency_command(window, key, now, &["acquire", &max, force, member])
+}
+
+fn release_command(window: &ConcurrencyWindow, key: &str, count: u64, now: i64) -> Command {
+    // Sent as a signed 64-bit integer, as hits are.
+    let count = count.min(i64::MAX as u64).to_string();
+    concurrency_command(window, key, now, &["release", &count])
+}
+
+fn remove_command(window: &ConcurrencyWindow, key: &str, member: &str, now: i64) -> Command {
+    concurrency_command(window, key, now, &["remove", member])
+}
+
+/// The slots in flight at `now`, read without changing anything.
+fn in_flight_command(window: &ConcurrencyWindow, key: &str, now: i64) -> Command {
+    Command {
+        name: "ZCOUNT",
+        args: vec![
+            key.to_string(),
+            format!("({}", now - window.lease),
+            "+inf".to_string(),
+        ],
     }
 }
 
@@ -503,6 +800,7 @@ impl RedisCache {
                     name: "HMGET",
                     args: vec![key, "a".into(), "c".into()],
                 },
+                Some(Window::Concurrency(window)) => in_flight_command(window, &key, now),
                 _ => Command {
                     name: "GET",
                     args: vec![key],
@@ -533,6 +831,11 @@ impl RedisCache {
                         reset: open.map(|w| window.reset(Some(w), now)),
                     }
                 }
+                // Slots have no window to reset.
+                Some(Window::Concurrency(_)) => LimitReading {
+                    used: command.counter(reply)?,
+                    reset: None,
+                },
                 _ => {
                     let calendar = self.settings.use_calendar_month;
                     let descriptor = &request.descriptors[index];
@@ -569,6 +872,28 @@ fn anchored_command(window: &AnchoredWindow, key: &str, hits: Hits, now: i64) ->
 }
 
 impl Command {
+    /// The concurrency script's reply.
+    fn slots(&self, reply: Value) -> Result<SlotResult, CacheError> {
+        let malformed = || self.failed("a concurrency window's reply is not 4 integers");
+        let Value::Array(values) = reply else {
+            return Err(malformed());
+        };
+        let numbers: Vec<u64> = values
+            .iter()
+            .filter_map(Value::as_i64)
+            .filter_map(|n| u64::try_from(n).ok())
+            .collect();
+        let [acquired, released, expired, in_flight] = numbers[..] else {
+            return Err(malformed());
+        };
+        Ok(SlotResult {
+            acquired: acquired == 1,
+            released,
+            expired,
+            in_flight,
+        })
+    }
+
     /// An anchored window's stored state, from `HMGET key a c`: none without an anchor.
     fn stored_anchored(&self, reply: Value) -> Result<Option<Anchored>, CacheError> {
         let malformed = || self.failed("an anchored window's state is not 2 integers");

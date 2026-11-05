@@ -640,6 +640,29 @@ impl crate::service::RateLimitCache for Backend {
             Backend::Memcache(cache) => cache.lookup(request, limits).await,
         }
     }
+
+    async fn check_slots(
+        &self,
+        request: &ratelimit_proto::envoy::service::ratelimit::v3::RateLimitRequest,
+        limits: &[Vec<crate::config::RateLimit>],
+        checks: &[crate::service::SlotCheck],
+    ) -> Result<Vec<crate::service::SlotAnswer>, crate::service::CacheError> {
+        match self {
+            Backend::Redis(cache) => cache.check_slots(request, limits, checks).await,
+            Backend::Memcache(cache) => cache.check_slots(request, limits, checks).await,
+        }
+    }
+
+    async fn return_slots(
+        &self,
+        limits: &[Vec<crate::config::RateLimit>],
+        answers: &[crate::service::SlotAnswer],
+    ) -> Result<(), crate::service::CacheError> {
+        match self {
+            Backend::Redis(cache) => cache.return_slots(limits, answers).await,
+            Backend::Memcache(cache) => cache.return_slots(limits, answers).await,
+        }
+    }
 }
 
 /// `newMemcacheFromSettings`: the servers of `MEMCACHE_HOST_PORT`, or of `MEMCACHE_SRV`

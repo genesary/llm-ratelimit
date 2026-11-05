@@ -62,18 +62,20 @@ The keys come out in alphabetical order; the example is reordered for reading.
 |---|---|
 | `now` | The instant of the snapshot, in UTC (RFC 3339, whole seconds). |
 | `name` | The limit's name. It is empty for a `rate_limit:` without one. |
-| `window` | `{"type": "fixed" \| "anchored", "duration_s": …}`, or, for a `rate_limit:`, `{"type": "unit", "unit": "HOUR"}`. |
+| `window` | `{"type": "fixed" \| "anchored", "duration_s": …}`, `{"type": "concurrency", "lease_s": …, "retry_after_s": …}`, or, for a `rate_limit:`, `{"type": "unit", "unit": "HOUR"}`. |
 | `limit` | `requests_per_unit`. |
 | `used` | The hits counted in the current window. It can exceed `limit`, since denied hits are counted too (`overflow: envoy`). |
 | `remaining` | `limit − used`, never below 0. |
 | `used_pct` | `used / limit × 100`, to one decimal, and not capped (`103.5`). A limit of 0 shows 100 once used, else 0. |
 | `resets_at`, `resets_in_s` | When the current window ends, and how long from `now`. |
 | `open` | For anchored windows only: whether a session is open. |
+| `in_flight` | For concurrency windows only: the slots held, leaving out those past their lease. `used` and `used_pct` count them too. |
 | `shadow_mode`, `quota_mode` | The descriptor's flags. The figures are the same either way. |
 
 The special cases:
 
 - **A closed session:** an `anchored` limit with no open session shows `used: 0`, `remaining: limit`, `open: false`, and `resets_at` and `resets_in_s` as `null`. Nothing is counting until the next request opens one.
+- **A concurrency window** has no reset: `resets_at` and `resets_in_s` are `null`.
 - **An `unlimited` limit** is `{"name": …, "unlimited": true}`, with no figures.
 - **A descriptor that no rule matches** gives `"limits": []`.
 - **Limits removed by `replaces`** are left out.

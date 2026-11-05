@@ -31,7 +31,9 @@ sequenceDiagram
 agentgateway sends two decisions per LLM request on a `tokens` descriptor:
 
 1. **A check, before the model is called.** It is enforced: an `OVER_LIMIT` answers the user with `429`, `x-ratelimit-*` headers and `retry-after`. It carries 0 hits, unless agentgateway's tokenization is on and no `cost` is set: then it carries the estimated input tokens.
-2. **An amendment, after the response.** It carries the tokens actually used, and agentgateway does not read its result. It is sent on errors and dropped streams too.
+2. **An amendment, after the response.** It carries the tokens actually used, and agentgateway does not read its result. It is sent after any response, errors included, and when a started stream is dropped. It is **not** sent after a denied check, or when no response was processed: a transport error, a timeout or client disconnect before the response headers, a failed read of a non-streamed body, a response prompt guard. Those requests count no tokens, and hold a [slot](#limiting-requests-in-flight) until its lease.
+
+This only works on an `ai` backend or an `llm` model, as below. On a plain HTTP route, such as a direct `backendRef` to an InferencePool, a `tokens` descriptor is skipped silently, and the user has no limit. The same goes for an `ai` backend's `Passthrough` and `Realtime` routes.
 
 So the limits must count every hit, denied ones included, which is `overflow: envoy`, the default. The session must open on the 0-hit check, which is `open_on: check`, also the default.
 
@@ -148,6 +150,82 @@ spec:
             unit: Tokens
 ```
 
+## Limiting requests in flight
+
+Volume quotas do not protect a busy GPU node from one harness sending many requests at once. A [`concurrency` window](../configuration.md#concurrency) limits what a user has in flight, per model, so that being limited on one model leaves the others free. It uses a second descriptor, and nothing else changes:
+
+```yaml
+# $RUNTIME_ROOT/ratelimit/config/llm.yaml, next to `user`
+  - key: inflight_user
+    descriptors:
+      - key: model
+        rate_limits:
+          - name: inflight
+            requests_per_unit: 8                # a broad safeguard, above what a user needs
+            window: {type: concurrency, lease: 10m, retry_after: 2s}
+```
+
+Standalone, under `remoteRateLimit`:
+
+```yaml
+      descriptors:
+      - entries:
+        - key: user
+          value: jwt.sub
+        type: tokens
+      - entries:
+        - key: inflight_user
+          value: jwt.sub
+        - key: model
+          value: llm.requestModel               # CEL: the model the client asked for
+        type: tokens
+        cost: '1'                               # required: the check then has 0 hits, the amendment 1
+```
+
+On Kubernetes, in the `AgentgatewayPolicy`:
+
+```yaml
+        descriptors:
+          - entries:
+              - name: user
+                expression: jwt.sub
+            unit: Tokens
+          - entries:
+              - name: inflight_user
+                expression: jwt.sub
+              - name: model
+                expression: llm.requestModel
+            unit: Tokens
+            cost: "1"
+```
+
+> **`cost: "1"` is what makes this work.** Without a `cost`, a descriptor's check can carry the tokenizer's count, and its amendment the tokens used: the window would release instead of taking slots. Watch `releases_without_slot`, which should stay near 0.
+
+A refused request answers `429` with `retry-after: 2`, unless a longer limit also refuses, and takes nothing from the session's budget. All `tokens` descriptors of a policy go in one call, so a request the session denies takes no slot.
+
+**Slots whose release is lost.** A slot is released by the amendment, so it stays until its `lease` when none comes:
+
+| The request ends with | The slot |
+|---|---|
+| A response, 5xx included | Released. A flow control TTL eviction answers 503, so it is released. |
+| A stream dropped by the model or the client, after it started | Released. |
+| A client leaving before the response headers, such as a request cancelled while queued by flow control | **Held until its lease.** |
+| A transport error, or `requestTimeout` or `backendRequestTimeout` before the headers | **Held until its lease.** |
+| A gateway killed mid-request | **Held until its lease.** |
+
+So expect orphans with flow control, one per cancellation in the queue:
+
+- **Keep the lease short,** around the p99 of request duration. It cannot be renewed: a request that outlives it lets up to two too many in, since its late amendment also releases another's slot. At the p99, that is about 1% of requests.
+- **Treat the limit as a broad safeguard,** with room for a few orphans. Fair sharing is the scheduler's job; to feed it, the workspace gateway should overwrite the header the llm-d Router reads with the user's identity (standalone: `transformations.request.set`; `AgentgatewayPolicy`: `transformation`; `x-llm-d-inference-fairness-id: jwt.sub`), never pass the client's on.
+- **Watch `slots_expired`**, which counts them. [`docs/upstream/agentgateway-amend-on-drop.md`](../upstream/agentgateway-amend-on-drop.md) proposes sending the amendment on these paths.
+
+**Configure the gateways so that requests get a response:**
+
+- **Workspace gateway:** no `retry` policy, since each attempt takes a slot, and no `requestTimeout` or `backendRequestTimeout` (`timeouts.request` in an `AgentgatewayPolicy`), which end a request without an amendment. `responseIdleTimeout` (`timeouts.responseIdle`) applies once the headers have arrived, so a stuck stream ends with its amendment.
+- **Inference gateway:** the timeouts and retries go here. Its 504 or 503 reaches the workspace gateway as a response, which releases the slot.
+
+**`failureMode: failOpen`.** If the check fails and the request goes on, its amendment still releases a slot, one this request never took, and possibly another's. See [several instances, one Valkey](../deployment.md#several-instances-one-valkey).
+
 ## What users see
 
 `GET /v1/quota` with the user's token:
@@ -165,6 +243,7 @@ A client shows it as "Session 40 % · resets in 2 h 05 · Week 62 % · resets Mo
 - **Before the first message:** the session has `open: false` and no reset time.
 - **Over 100 %:** `used_pct` can pass 100, because the amendment of the last request is counted even when it overshoots. The next request is then denied until `resets_at`.
 - **Leave the local cache off:** with `LOCAL_CACHE_SIZE_IN_BYTES` set, an amendment on a weekly limit already over can be answered from the cache and not counted, so its `used_pct` stops growing. `anchored` sessions are never cached.
+- **In flight:** a `concurrency` limit shows `in_flight`, with `limit` and `used_pct`, and no reset: "Requests 2 / 8". To show it, send its descriptor with the user's `model` to `/quota` too.
 - **Polling:** poll about once a minute.
 
 Over the limit, the chat request itself answers `429`, with `retry-after` set to the seconds left before the exhausted limit resets (if both are, the later of the two).

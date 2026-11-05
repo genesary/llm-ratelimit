@@ -28,6 +28,37 @@ pub struct LimitOutcome {
     pub status: DescriptorStatus,
     /// An anchored window this request opened without counting hits (D9).
     pub opened_without_hits: bool,
+    /// A concurrency window waiting for the request's decision before taking a slot (D35): its
+    /// status stands for a slot still free.
+    pub slot_pending: bool,
+}
+
+/// A concurrency window's slot, once the request's other limits have decided (D35).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotCheck {
+    /// The descriptor's index in the request, and the limit's in the descriptor's limits.
+    pub index: usize,
+    pub limit: usize,
+    /// Take a slot, or only read what is in flight for the answer.
+    pub acquire: bool,
+    /// Take it past the limit: shadow mode.
+    pub force: bool,
+}
+
+/// What a [`SlotCheck`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlotAnswer {
+    pub check: SlotCheck,
+    pub status: DescriptorStatus,
+    /// The slot taken, to release it if the request ends up denied.
+    pub held: Option<HeldSlot>,
+}
+
+/// A slot taken for a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldSlot {
+    pub key: String,
+    pub member: String,
 }
 
 impl From<DescriptorStatus> for LimitOutcome {
@@ -35,6 +66,7 @@ impl From<DescriptorStatus> for LimitOutcome {
         Self {
             status,
             opened_without_hits: false,
+            slot_pending: false,
         }
     }
 }
@@ -57,6 +89,25 @@ pub trait RateLimitCache: Send + Sync + 'static {
         _limits: &[Vec<RateLimit>],
     ) -> impl Future<Output = Result<(i64, Vec<Vec<LimitReading>>), CacheError>> + Send {
         async { Err(CacheError("this backend has no quota lookup".into())) }
+    }
+
+    /// Answers `checks`, the slots `do_limit` left pending (D35), in their order.
+    fn check_slots(
+        &self,
+        _request: &RateLimitRequest,
+        _limits: &[Vec<RateLimit>],
+        _checks: &[SlotCheck],
+    ) -> impl Future<Output = Result<Vec<SlotAnswer>, CacheError>> + Send {
+        async { Err(CacheError("this backend has no concurrency windows".into())) }
+    }
+
+    /// Releases the slots of `answers`, for a request that ended up denied (D35).
+    fn return_slots(
+        &self,
+        _limits: &[Vec<RateLimit>],
+        _answers: &[SlotAnswer],
+    ) -> impl Future<Output = Result<(), CacheError>> + Send {
+        async { Ok(()) }
     }
 }
 
@@ -84,6 +135,23 @@ impl<T: RateLimitCache> RateLimitCache for Arc<T> {
         limits: &[Vec<RateLimit>],
     ) -> impl Future<Output = Result<(i64, Vec<Vec<LimitReading>>), CacheError>> + Send {
         T::lookup(self, request, limits)
+    }
+
+    fn check_slots(
+        &self,
+        request: &RateLimitRequest,
+        limits: &[Vec<RateLimit>],
+        checks: &[SlotCheck],
+    ) -> impl Future<Output = Result<Vec<SlotAnswer>, CacheError>> + Send {
+        (**self).check_slots(request, limits, checks)
+    }
+
+    fn return_slots(
+        &self,
+        limits: &[Vec<RateLimit>],
+        answers: &[SlotAnswer],
+    ) -> impl Future<Output = Result<(), CacheError>> + Send {
+        (**self).return_slots(limits, answers)
     }
 }
 
@@ -346,7 +414,7 @@ impl<C: RateLimitCache> RateLimitService<C> {
         let config = self.config_for(request)?;
         let (plans, limits) = self.plans(&config, request)?;
         let outcomes = self.cache.do_limit(request, &limits).await?;
-        let per_limit: Vec<Vec<DescriptorStatus>> = outcomes
+        let mut per_limit: Vec<Vec<DescriptorStatus>> = outcomes
             .iter()
             .map(|list| list.iter().map(|o| o.status.clone()).collect())
             .collect();
@@ -364,6 +432,8 @@ impl<C: RateLimitCache> RateLimitService<C> {
             ))
             .into());
         }
+        self.settle_slots(request, &plans, &limits, &outcomes, &mut per_limit)
+            .await?;
         // Each descriptor's representative status (D17), then its shadow mode.
         let representatives: Vec<Option<usize>> =
             per_limit.iter().map(|s| representative(s)).collect();
@@ -384,11 +454,6 @@ impl<C: RateLimitCache> RateLimitService<C> {
             crate::prototext::statuses(&statuses)
         );
 
-        // A regular descriptor over its limit makes the request over. Quota descriptors are
-        // grouped by model: a group is over when any of its descriptors is, and the request
-        // only when every group is (so another model can take over).
-        let mut regular_over = false;
-        let mut quota_groups: HashMap<String, bool> = HashMap::new();
         // The descriptor closest to its limit, for the headers: chosen among the backend's
         // statuses (unlimited ones have no limit), the first on a tie, but the last regular
         // descriptor over its limit wins outright, counting as 0 remaining. With its limit and
@@ -423,11 +488,8 @@ impl<C: RateLimitCache> RateLimitService<C> {
                 Plan::Limits(limits) => limits.first(),
             };
             let over = status.code() == Code::OverLimit;
-            let quota_mode = self.settings.global_quota_mode || limit.is_some_and(|l| l.quota_mode);
+            let quota_mode = self.quota_mode(limit);
             let quota_group = quota_mode.then(|| quota_group_key(descriptor));
-            if let Some(group) = &quota_group {
-                *quota_groups.entry(group.clone()).or_default() |= over;
-            }
             if !over {
                 passed.push(Passed {
                     descriptor,
@@ -435,13 +497,13 @@ impl<C: RateLimitCache> RateLimitService<C> {
                     quota_group,
                 });
             } else if !quota_mode {
-                regular_over = true;
                 if let Some(limit) = chosen {
                     closest = Some((status.clone(), limit, descriptor));
                 }
                 min_remaining = 0;
             }
         }
+        let (regular_over, quota_groups) = self.over(request, &plans, &limits, &per_limit);
         let quota_over = !quota_groups.is_empty() && quota_groups.values().all(|over| *over);
         let mut overall_code = if regular_over || quota_over {
             Code::OverLimit
@@ -494,6 +556,109 @@ impl<C: RateLimitCache> RateLimitService<C> {
             dynamic_metadata,
             ..Default::default()
         })
+    }
+
+    /// Whether `limit`'s descriptor is in quota mode. A concurrency limit never is (D35).
+    fn quota_mode(&self, limit: Option<&RateLimit>) -> bool {
+        let concurrency = limit.is_some_and(|l| matches!(l.window, Some(Window::Concurrency(_))));
+        !concurrency && (self.settings.global_quota_mode || limit.is_some_and(|l| l.quota_mode))
+    }
+
+    /// Whether a regular descriptor is over its limit, and which quota groups are. Quota
+    /// descriptors are grouped by model: a group is over when any of its descriptors is, and
+    /// denies the request only when every group is (so another model can take over).
+    fn over(
+        &self,
+        request: &RateLimitRequest,
+        plans: &[Plan],
+        limits: &[Vec<RateLimit>],
+        per_limit: &[Vec<DescriptorStatus>],
+    ) -> (bool, HashMap<String, bool>) {
+        let mut regular_over = false;
+        let mut quota_groups: HashMap<String, bool> = HashMap::new();
+        for (((statuses, limits), plan), descriptor) in per_limit
+            .iter()
+            .zip(limits)
+            .zip(plans)
+            .zip(&request.descriptors)
+        {
+            let Plan::Limits(planned) = plan else {
+                continue;
+            };
+            let over = representative(statuses)
+                .is_some_and(|i| statuses[i].code() == Code::OverLimit && !limits[i].shadow_mode);
+            if self.quota_mode(planned.first()) {
+                *quota_groups.entry(quota_group_key(descriptor)).or_default() |= over;
+            } else {
+                regular_over |= over;
+            }
+        }
+        (regular_over, quota_groups)
+    }
+
+    /// Whether `per_limit` denies the request, global shadow mode aside.
+    fn denied(
+        &self,
+        request: &RateLimitRequest,
+        plans: &[Plan],
+        limits: &[Vec<RateLimit>],
+        per_limit: &[Vec<DescriptorStatus>],
+    ) -> bool {
+        let (regular_over, quota_groups) = self.over(request, plans, limits, per_limit);
+        regular_over || (!quota_groups.is_empty() && quota_groups.values().all(|over| *over))
+    }
+
+    /// Decides the slots `do_limit` left pending, once the other limits have decided (D35,
+    /// ADR 0004): none is taken for a request they deny, and those taken for a request
+    /// another concurrency limit denies are released.
+    async fn settle_slots(
+        &self,
+        request: &RateLimitRequest,
+        plans: &[Plan],
+        limits: &[Vec<RateLimit>],
+        outcomes: &[Vec<LimitOutcome>],
+        per_limit: &mut [Vec<DescriptorStatus>],
+    ) -> Result<(), ServiceError> {
+        // Upstream's limits never get here.
+        if !outcomes.iter().flatten().any(|o| o.slot_pending) {
+            return Ok(());
+        }
+        let shadow = self.settings.global_shadow_mode;
+        let acquire = shadow || !self.denied(request, plans, limits, per_limit);
+        let checks: Vec<SlotCheck> = outcomes
+            .iter()
+            .enumerate()
+            .flat_map(|(index, list)| {
+                let limits = &limits[index];
+                list.iter()
+                    .enumerate()
+                    .filter(|(_, outcome)| outcome.slot_pending)
+                    .map(move |(limit, _)| SlotCheck {
+                        index,
+                        limit,
+                        acquire,
+                        force: shadow || limits[limit].shadow_mode,
+                    })
+            })
+            .collect();
+        let answers = self.cache.check_slots(request, limits, &checks).await?;
+        for answer in &answers {
+            per_limit[answer.check.index][answer.check.limit] = answer.status.clone();
+        }
+        if !shadow && self.denied(request, plans, limits, per_limit) {
+            // The slot was only held for an instant, and no amendment will come for it.
+            if let Err(e) = self.cache.return_slots(limits, &answers).await {
+                crate::log::error(&format!("Failing to release a slot: {}", e.0));
+                return Ok(());
+            }
+            for answer in answers.iter().filter(|a| a.held.is_some()) {
+                let status = &mut per_limit[answer.check.index][answer.check.limit];
+                if status.code() == Code::Ok {
+                    status.limit_remaining = status.limit_remaining.saturating_add(1);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The quota lookup (ADR 0003): every limit applying to the request's descriptors, as the

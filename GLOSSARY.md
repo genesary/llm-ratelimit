@@ -50,6 +50,22 @@ _Avoid_: rolling window, session window
 When an anchored window opened, rounded down to the window's rounding.
 _Avoid_: start time, opening time
 
+**Concurrency window**:
+A limit on requests in flight rather than on hits over time: a check takes a slot and an amendment gives it back.
+_Avoid_: in-flight limit, semaphore
+
+**Slot**:
+One request in flight in a concurrency window, until an amendment releases it or its lease ends.
+_Avoid_: permit, token
+
+**Lease**:
+How long a slot lasts without an amendment.
+_Avoid_: slot timeout, TTL
+
+**Orphan**:
+A slot whose request ended with no amendment: it lasts until its lease.
+_Avoid_: leak, ghost slot
+
 **Session**:
 An open anchored window, as a user sees it: Claude's five-hour session.
 _Avoid_: conversation

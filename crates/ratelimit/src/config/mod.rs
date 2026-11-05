@@ -11,7 +11,7 @@ use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescript
 use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response;
 use schema::YamlDescriptor;
 use std::collections::{HashMap, HashSet};
-use window::{AnchoredWindow, FixedWindow, OpenOn, Origin, Window};
+use window::{AnchoredWindow, ConcurrencyWindow, FixedWindow, OpenOn, Origin, Window};
 
 /// A config file to load: its name (used in error messages) and its YAML content.
 #[derive(Debug, Clone)]
@@ -297,6 +297,7 @@ fn load_window(file: &str, at: &str, window: &schema::YamlWindow) -> Result<Wind
     let anchored = match window.kind.as_str() {
         "fixed" => false,
         "anchored" => true,
+        "concurrency" => return load_concurrency(window, &error).map(Window::Concurrency),
         "" => return Err(error("window type is required".into())),
         "sliding" | "sliding_approx" | "token_bucket" => {
             return Err(error(format!(
@@ -306,6 +307,14 @@ fn load_window(file: &str, at: &str, window: &schema::YamlWindow) -> Result<Wind
         }
         other => return Err(error(format!("unknown window type '{other}'"))),
     };
+    for (key, value) in [
+        ("lease", &window.lease),
+        ("retry_after", &window.retry_after),
+    ] {
+        if !value.is_empty() {
+            return Err(error(format!("{key} is for concurrency windows")));
+        }
+    }
     let duration = match window.duration.as_str() {
         "" => return Err(error("window duration is required".into())),
         text => window::parse_duration(text)
@@ -371,6 +380,38 @@ fn load_window(file: &str, at: &str, window: &schema::YamlWindow) -> Result<Wind
         }
     };
     Ok(Window::Fixed(FixedWindow { duration, origin }))
+}
+
+/// A `concurrency` window's `lease` and `retry_after` (D35).
+fn load_concurrency(
+    window: &schema::YamlWindow,
+    error: &impl Fn(String) -> ConfigError,
+) -> Result<ConcurrencyWindow, ConfigError> {
+    for (key, value) in [
+        ("duration", &window.duration),
+        ("offset", &window.offset),
+        ("offset_rounding", &window.offset_rounding),
+        ("start_rounding", &window.start_rounding),
+        ("open_on", &window.open_on),
+    ] {
+        if !value.is_empty() {
+            return Err(error(format!("{key} is not for concurrency windows")));
+        }
+    }
+    let seconds = |key: &str, text: &str| {
+        window::parse_duration(text)
+            .filter(|s| *s > 0)
+            .ok_or_else(|| error(format!("invalid {key} '{text}'")))
+    };
+    let lease = match window.lease.as_str() {
+        "" => return Err(error("lease is required".into())),
+        text => seconds("lease", text)?,
+    };
+    let retry_after = match window.retry_after.as_str() {
+        "" => 1,
+        text => seconds("retry_after", text)?,
+    };
+    Ok(ConcurrencyWindow { lease, retry_after })
 }
 
 /// An `anchored` window's `start_rounding` and `open_on` (D9).
@@ -492,6 +533,16 @@ fn load_list(
         let window = load_window(file, &at, window)?;
         if options.memcached && !matches!(window, Window::Fixed(_)) {
             return Err(error("only fixed windows can be counted on Memcached"));
+        }
+        if matches!(window, Window::Concurrency(_)) {
+            if list.len() > 1 {
+                return Err(error(
+                    "a concurrency limit must be alone in its rate_limits: hits release its slots",
+                ));
+            }
+            if config.quota_mode {
+                return Err(error("a concurrency limit cannot be in quota_mode"));
+            }
         }
         // `<hash tag>}_<shape>_<name>`, the window's start left out.
         let static_bytes = key_start.len() + 2 + window.shape().len() + 1 + entry.name.len();
