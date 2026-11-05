@@ -188,7 +188,7 @@ async fn observe(image: &str, network: &str, redis: &str, ipv6: bool) -> Vec<Str
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(healthy, "{image}: {}", container(&["logs", &id]));
-    // No shell: only `/bin/ratelimit` runs.
+    // No shell: only the binary runs.
     let shell = Command::new(cli())
         .args([
             "run",
@@ -325,7 +325,45 @@ async fn the_image_serves_like_upstreams() {
     }
 }
 
-/// LICENSE, NOTICE and the crates' licenses (cargo-about) in `/usr/share/doc/ratelimit`
+/// The new name is the entrypoint, and upstream's manifests' `/bin/ratelimit` still runs the
+/// same binary: each refuses a bad setting the same way.
+#[test]
+fn both_binary_paths_run() {
+    let Ok(image) = std::env::var("RATELIMIT_IMAGE") else {
+        return;
+    };
+    assert_eq!(
+        container(&[
+            "image",
+            "inspect",
+            "--format",
+            "{{json .Config.Entrypoint}}",
+            &image
+        ]),
+        r#"["/bin/llm-ratelimit"]"#
+    );
+    for path in ["/bin/llm-ratelimit", "/bin/ratelimit"] {
+        let output = Command::new(cli())
+            .args([
+                "run",
+                "--rm",
+                "--env",
+                "BACKEND_TYPE=bogus",
+                "--entrypoint",
+                path,
+                &image,
+            ])
+            .output()
+            .expect("run the container CLI");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Invalid setting for BackendType: bogus"),
+            "{path}: {stderr}"
+        );
+    }
+}
+
+/// LICENSE, NOTICE and the crates' licenses (cargo-about) in `/usr/share/doc/llm-ratelimit`
 /// (docs/design.md D34).
 #[test]
 fn the_image_ships_its_licenses() {
@@ -338,7 +376,7 @@ fn the_image_ships_its_licenses() {
     let _dir = Created::Directory(dir.clone());
     container(&[
         "cp",
-        &format!("{id}:/usr/share/doc/ratelimit"),
+        &format!("{id}:/usr/share/doc/llm-ratelimit"),
         &dir.to_string_lossy(),
     ]);
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();

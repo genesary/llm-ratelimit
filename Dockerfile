@@ -1,7 +1,8 @@
-# The service's image (docs/design.md D33): a static binary at /bin/ratelimit on distroless,
-# as upstream's, for linux/amd64 and linux/arm64. Cross-compiled with cargo-zigbuild on the
-# build platform. LICENSE, NOTICE and the crates' licenses (cargo-about, D34) are shipped in
-# /usr/share/doc/ratelimit.
+# The service's image (docs/design.md D33): a static binary at /bin/llm-ratelimit on distroless,
+# for linux/amd64 and linux/arm64. /bin/ratelimit, the path upstream's manifests call, is a link
+# to it: one binary, whichever name it is called by, with no second copy in the image.
+# Cross-compiled with cargo-zigbuild on the build platform. LICENSE, NOTICE and the crates'
+# licenses (cargo-about, D34) are shipped in /usr/share/doc/llm-ratelimit.
 FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3-pip \
@@ -25,14 +26,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       arm64) target=aarch64-unknown-linux-musl ;; \
       *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac \
-    && cargo zigbuild --release --locked -p ratelimit --bin ratelimit --target "$target" \
-    && cp "target/$target/release/ratelimit" /ratelimit \
+    && cargo zigbuild --release --locked -p llm-ratelimit --bin llm-ratelimit --target "$target" \
+    && mkdir -p /image/bin \
+    && cp "target/$target/release/llm-ratelimit" /image/bin/llm-ratelimit \
+    && ln -s llm-ratelimit /image/bin/ratelimit \
     && mkdir /doc \
     && cp LICENSE NOTICE /doc \
     && cargo fetch --locked \
     && cargo about generate --frozen --fail about.hbs -o /doc/THIRD-PARTY-LICENSES.txt
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
-COPY --from=build /ratelimit /bin/ratelimit
-COPY --from=build /doc /usr/share/doc/ratelimit
-ENTRYPOINT ["/bin/ratelimit"]
+# A directory, as a file would be copied through its link.
+COPY --from=build /image/bin/ /bin/
+COPY --from=build /doc /usr/share/doc/llm-ratelimit
+ENTRYPOINT ["/bin/llm-ratelimit"]

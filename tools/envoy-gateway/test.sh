@@ -5,7 +5,7 @@
 # image and with ours, only the chart's `global.images.ratelimit.image` changed.
 #
 # Usage: test.sh IMAGE, a local image named REGISTRY/REPOSITORY:TAG (Envoy Gateway's chart
-# splits it so, e.g. localhost/ratelimit:ci). Needs kind, kubectl, helm, jq, curl and the container
+# splits it so, e.g. localhost/llm-ratelimit:ci). Needs kind, kubectl, helm, jq, curl and the container
 # CLI (CONTAINER_CLI, docker by default). KEEP_CLUSTER=1 keeps the cluster.
 set -euo pipefail
 
