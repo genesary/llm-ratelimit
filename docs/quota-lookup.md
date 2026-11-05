@@ -104,4 +104,4 @@ The lookup has its own stats, separate from the rate-limit ones:
 ## Good to know
 
 - **Cost:** a lookup costs Redis as much as a decision, a read per limit. Poll at human pace, around once a minute, not on every keystroke.
-- **The local cache:** with `LOCAL_CACHE_SIZE_IN_BYTES` set, a decision can deny from the local cache a key that Redis has lost (a flush, an eviction). The lookup reads Redis only, so for the cache entry's lifetime it can show such a limit as available while decisions deny it.
+- **The local cache:** with `LOCAL_CACHE_SIZE_IN_BYTES` set, a decision can deny from the local cache a key that Redis has lost (a flush, an eviction). The lookup reads Redis only, so for the cache entry's lifetime it can show such a limit as available while decisions deny it. The hits it answers are not counted either, so a `fixed` limit's `used` stops growing. `anchored` windows are never cached.

@@ -164,6 +164,7 @@ A client shows it as "Session 40 % · resets in 2 h 05 · Week 62 % · resets Mo
 - **Percentages:** use `used_pct`. The raw token counts need not be shown.
 - **Before the first message:** the session has `open: false` and no reset time.
 - **Over 100 %:** `used_pct` can pass 100, because the amendment of the last request is counted even when it overshoots. The next request is then denied until `resets_at`.
+- **Leave the local cache off:** with `LOCAL_CACHE_SIZE_IN_BYTES` set, an amendment on a `fixed` limit already over is answered from the cache and not counted, so its `used_pct` stops growing. `anchored` sessions are never cached.
 - **Polling:** poll about once a minute.
 
 Over the limit, the chat request itself answers `429`, with `retry-after` set to the seconds left before the exhausted limit resets (if both are, the later of the two).

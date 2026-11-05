@@ -294,6 +294,7 @@ LOCAL_CACHE_SIZE_IN_BYTES=10485760   # 10 MiB
 - **What it holds.** The key of a `rate_limit:` limit or a `fixed` window, once a decision finds it over the limit. It stays for the window's length.
 - **What it never holds.** `anchored` windows: Redis is asked every time.
 - **Shadow mode.** A key over its limit is cached even when its limit is in `shadow_mode`. With the cache on, later requests for that key are answered from it, and their hits are not counted in the backend.
+- **Lost hits.** Hits answered from it are never counted in the backend, a token amendment included: a `fixed` limit's `used` stops growing until its window ends.
 - **Refunds** always reach the backend. They do not remove a key from the local cache: a key cached as over its limit stays so until its entry expires.
 - **Memory.** It is a port of [freecache](https://github.com/coocood/freecache), down to its memory layout, so it evicts the same keys as upstream when full. Below 512 KiB, its size is 512 KiB.
 - **Stats.** Requests answered from it count in `over_limit_with_local_cache`; its own figures are in the `localcache.*` gauges.
