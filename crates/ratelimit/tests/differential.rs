@@ -13941,6 +13941,43 @@ async fn list_keys_over_their_limit_are_kept_in_the_local_cache() {
     );
 }
 
+/// The local cache never holds an anchored window (D18): over its limit, each request still
+/// reaches Redis, so an amendment is counted.
+#[tokio::test]
+async fn anchored_windows_stay_out_of_the_local_cache() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        cache: CacheSettings {
+            local_cache_size_in_bytes: 1 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(SESSION, settings).await;
+    let alice: &[&[(&str, &str)]] = &[&[("user", "alice")]];
+    h.at(1_000_000_000);
+    h.call(hits(alice, 4)).await;
+    h.call(hits(alice, 100)).await;
+    let lookup = h
+        .subject
+        .service
+        .lookup(&request("d", alice))
+        .await
+        .unwrap();
+    let rendered: serde_json::Value =
+        serde_json::from_str(&ratelimit::quota::render(&lookup)).unwrap();
+    let session = &rendered["descriptors"][0]["limits"][0];
+    assert_eq!(session["name"], "five_hour");
+    assert_eq!(session["used"], 104);
+    assert!(
+        !h.stats().contains_key(
+            "ratelimit.service.rate_limit.d.user~five_hour.over_limit_with_local_cache"
+        )
+    );
+}
+
 /// `LIMIT_PER_UNIT_HEADERS_ENABLED` describes every limit of every list, a window of several
 /// units under its own name (D13); `RateLimit-Reset` is the representative's window's,
 /// offset included, re-read from the clock.

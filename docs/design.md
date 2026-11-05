@@ -110,7 +110,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 
 **D14. Counting mode per descriptor** *(amended)*: `overflow: envoy | strict`.
 
-- `envoy` (default, for `rate_limit:` and `rate_limits:`): everything is counted, including denied requests. It is the only mode that never loses agentgateway's token amendments, sent after the response without reading the result.
+- `envoy` (default, for `rate_limit:` and `rate_limits:`): everything is counted, including denied requests. It is the only mode that never loses agentgateway's token amendments, sent after the response without reading the result, unless the local cache answers (D18).
 - `strict`: all-or-nothing over the list. **A descriptor whose list is exhausted is not counted**, and a denied request changes no state (anchor included, D9).
 - 0-hit request: `envoy` uses `>` like the reference, `strict` uses `>=`.
 - To document: in `strict`, a denied agentgateway amendment is lost without a signal; with a `cost` expression, an amendment larger than the remaining tokens is denied and the bucket is not touched, so `strict` + `cost` limits almost nothing.
@@ -128,7 +128,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 - A descriptor whose limits are all replaced leaves the quota group (except under global `QUOTA_MODE`) but appears in `passedBackends` if it carries a group key.
 - **`share_threshold`**: the pattern replaces the value in the `{…}` part of keys (ADR 0001) and in the input of the `offset: hashed` hash (ADR 0002). **`detailed_metric`**, **`value_to_metric`**: stats only, every type.
 
-**D18. Local cache.** Legacy and `fixed`: the reference's exact behaviour (entry set before the shadow check, TTL = full unit length, a limit in shadow mode is no longer counted when the cache is enabled, `over_limit_with_local_cache` counts `hitsAddend`). New types: an entry lives until the earliest moment the decision can change; cached only when less than one unit remains; a refund clears the local entry (deliberate divergence, new types only); no caching for limits in shadow mode.
+**D18. Local cache** *(amended)*. Legacy and `fixed`: the reference's exact behaviour (entry set before the shadow check, TTL = full unit length, a limit in shadow mode is no longer counted when the cache is enabled, `over_limit_with_local_cache` counts `hitsAddend`), so hits it answers are not counted, amendments included. `anchored`: never cached, Redis decides every time. When its decision can change is unknowable across instances (a refund on another one, a reload), an entry would lose amendments, and it saves little, since a list's other limits still reach Redis; to revisit if a load is reported, by caching 0-hit checks only. Other new types: an entry lives until the earliest moment the decision can change; cached only when less than one unit remains; a refund clears the local entry (deliberate divergence, new types only); no caching for limits in shadow mode.
 
 **D19. `quota_mode` and lasting lockout.** Warning at load (log and gauge) when `quota_mode` is combined with `sliding`, or with `token_bucket` with `max_debt: unlimited`, in `envoy` mode: a group can stay blocked as long as traffic exceeds the rate.
 

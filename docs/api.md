@@ -66,7 +66,7 @@ Each descriptor is decided on its own, with its own limits. The request's answer
 | its own `hits_addend: N` | N, whatever the request's |
 | its own `hits_addend: 0` | 0: a check |
 
-- **Every hit is counted, denied requests included.** A request that is over the limit still adds its hits, as upstream does. A descriptor whose limit is already reached stays over until its window ends.
+- **Every hit is counted, denied requests included.** A request that is over the limit still adds its hits, as upstream does, unless the [local cache](backends.md#the-local-cache) answers it. A descriptor whose limit is already reached stays over until its window ends.
 - **A descriptor is over its limit** when its counter, once this request's hits are added, is greater than `requests_per_unit`. A check (0 hits) is therefore OK while the counter is at most the limit, and OVER_LIMIT once it has gone past it.
 - **A `rate_limits:` list** counts the hits in every one of its limits.
 - **A refund** (`is_negative_hits: true`) subtracts the hits:

@@ -530,7 +530,7 @@ Some keys stay at the **descriptor** level and apply to every limit of its list:
 - `share_threshold`;
 - `metadata`.
 
-`overflow: envoy`, the default, counts every hit, denied requests included, as upstream does. `overflow: strict` is designed but not built yet, and is refused at load.
+`overflow: envoy`, the default, counts every hit, denied requests included, as upstream does, except those the [local cache](backends.md#the-local-cache) answers. `overflow: strict` is designed but not built yet, and is refused at load.
 
 A list entry takes a `window`, not a `unit`, and cannot be `unlimited`. For an unlimited descriptor, keep `rate_limit: {unlimited: true}`.
 
