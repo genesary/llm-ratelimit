@@ -111,6 +111,27 @@ async fn the_listener_binds_like_go() {
 /// The shipped mapper puts the quota lookup's error cause in a label (ADR 0003), and its
 /// response time in seconds, unless `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS`.
 #[test]
+fn the_default_mapper_labels_config_fingerprints() {
+    use ratelimit::stats::prometheus::MetricType;
+    let mapper = prometheus::load_mapper(&PrometheusSettings::default()).unwrap();
+    let gauge = mapper
+        .get_mapping(
+            "ratelimit.service.config_fingerprint.llm.prod.0123456789abcdef",
+            MetricType::Gauge,
+        )
+        .unwrap();
+    assert_eq!(gauge.name, "ratelimit_service_config_fingerprint");
+    assert_eq!(
+        gauge.labels,
+        [
+            ("domain".to_string(), "llm.prod".to_string()),
+            ("fingerprint".to_string(), "0123456789abcdef".to_string()),
+        ]
+        .into()
+    );
+}
+
+#[test]
 fn the_default_mapper_maps_the_lasting_lockouts_gauge() {
     use ratelimit::stats::prometheus::MetricType;
     let mapper = prometheus::load_mapper(&PrometheusSettings::default()).unwrap();

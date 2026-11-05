@@ -306,7 +306,7 @@ One service per workspace, all on one Redis or Valkey, gives a user the same quo
 - `CACHE_KEY_PREFIX`;
 - the domain and the descriptors: their keys, and which values they match;
 - each limit's `name` and window: type, duration, offset, rounding, and `requests_per_unit`, `lease`;
-- `EXPIRATION_JITTER_MAX_SECONDS`, `USE_CALENDAR_MONTH_RATE_LIMIT`, `NEAR_LIMIT_RATIO`.
+- `EXPIRATION_JITTER_MAX_SECONDS`, `USE_CALENDAR_MONTH_RATE_LIMIT`, `NEAR_LIMIT_RATIO`, `QUOTA_MODE`, `SHADOW_MODE`.
 
 Keep the [local cache](backends.md#the-local-cache) off: it holds what one instance saw, for a window.
 
@@ -318,6 +318,8 @@ Keep the [local cache](backends.md#the-local-cache) off: it holds what one insta
 | `requests_per_unit` | One key, two thresholds: the same counter is judged differently, depending on the workspace. |
 | A `concurrency` limit's `lease` | One key: each operation purges by its own instance's lease, so the shortest lease wins. |
 | A `concurrency` limit's `requests_per_unit` | One key: an instance with the higher limit takes slots past the other's, which then refuses. |
+
+To detect a difference in the config files, alert on the [config fingerprint](observability.md#configs-that-diverge) each instance reports. It does not cover the environment variables above, so keep those in one place.
 
 **`failureMode` when Valkey is the single point of failure.** agentgateway decides what happens when the service answers an error.
 

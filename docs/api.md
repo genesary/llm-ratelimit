@@ -323,7 +323,7 @@ curl -i localhost:8080/healthcheck
 | Path | Answer |
 |---|---|
 | `/` | The list of the paths below. Any path not listed answers it too. |
-| `/rlconfig` | The configuration in use, one line per limit. Empty before a configuration loads. |
+| `/rlconfig` | The configuration in use, one line per limit, then a [fingerprint](observability.md#configs-that-diverge) per domain with a `rate_limits:` list. Empty before a configuration loads. |
 | `/stats` | `cmdline`: the process's command line, as JSON. |
 | `/debug/pprof/` | `404 Unknown profile`. |
 | `/debug/pprof/<name>` (`heap`, `goroutine`, …) | `404 Unknown profile`. |

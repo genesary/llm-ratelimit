@@ -117,6 +117,13 @@ mappings:
     labels:
       grpc_method: "$1"
 
+  - match: "^ratelimit\\.service\\.config_fingerprint\\.(.+)\\.([0-9a-f]{16})$"
+    match_type: regex
+    name: "ratelimit_service_config_fingerprint"
+    match_metric_type: gauge
+    labels:
+      domain: "$1"
+      fingerprint: "$2"
   - match: "ratelimit.service.config_lasting_lockouts"
     name: "ratelimit_service_config_lasting_lockouts"
     match_metric_type: gauge
