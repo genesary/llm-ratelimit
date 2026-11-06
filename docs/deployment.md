@@ -19,7 +19,7 @@ ghcr.io/genesary/llm-ratelimit:<version>
 
 | | |
 |---|---|
-| **Tags** | Set by the release workflow: the version (`0.2.0`) and its major and minor (`0.1`), each also with a `v` like the git tag (`v0.1.0`, `v0.1`), and `sha-<commit>` |
+| **Tags** | Set by the release workflow: the version (`0.3.0`) and its major and minor (`0.1`), each also with a `v` like the git tag (`v0.1.0`, `v0.1`), and `sha-<commit>` |
 | **Platforms** | `linux/amd64`, `linux/arm64` |
 | **Binary** | `/bin/llm-ratelimit`, the entrypoint, and `/bin/ratelimit`, a link to it, the path upstream's manifests call. It takes no arguments: everything is set by environment variables. |
 | **Base** | `gcr.io/distroless/static-debian12:nonroot`, as upstream's: no shell, no package manager, no `curl`. |
@@ -31,7 +31,7 @@ ghcr.io/genesary/llm-ratelimit:<version>
 Without a shell, files are read from outside the container. To read the licenses:
 
 ```sh
-id=$(docker create ghcr.io/genesary/llm-ratelimit:0.2.0)
+id=$(docker create ghcr.io/genesary/llm-ratelimit:0.3.0)
 docker cp "$id:/usr/share/doc/llm-ratelimit" ./llm-ratelimit-licenses
 docker rm "$id"
 ```
@@ -41,8 +41,8 @@ docker rm "$id"
 Each release is signed with cosign (keyless, by the release workflow's GitHub identity), and carries an SBOM and a provenance attestation:
 
 ```sh
-cosign verify ghcr.io/genesary/llm-ratelimit:0.2.0 \
-  --certificate-identity https://github.com/genesary/llm-ratelimit/.github/workflows/release.yml@refs/tags/v0.2.0 \
+cosign verify ghcr.io/genesary/llm-ratelimit:0.3.0 \
+  --certificate-identity https://github.com/genesary/llm-ratelimit/.github/workflows/release.yml@refs/tags/v0.3.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
@@ -118,7 +118,7 @@ services:
     command: ["redis-server", "--save", ""]
 
   ratelimit:
-    image: ghcr.io/genesary/llm-ratelimit:0.2.0
+    image: ghcr.io/genesary/llm-ratelimit:0.3.0
     depends_on: [redis]
     user: "65534:65534"
     read_only: true
@@ -193,7 +193,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: ratelimit
-          image: ghcr.io/genesary/llm-ratelimit:0.2.0
+          image: ghcr.io/genesary/llm-ratelimit:0.3.0
           env:
             - {name: RUNTIME_SUBDIRECTORY, value: ratelimit}
             - {name: RUNTIME_WATCH_ROOT, value: "false"}
@@ -268,7 +268,7 @@ The chart values of that test:
 global:
   images:
     ratelimit:
-      image: ghcr.io/genesary/llm-ratelimit:0.2.0
+      image: ghcr.io/genesary/llm-ratelimit:0.3.0
       pullPolicy: IfNotPresent
 config:
   envoyGateway:

@@ -11,7 +11,7 @@ body:
     attributes:
       label: Version
       description: The image tag or digest, or the commit you built.
-      placeholder: ghcr.io/genesary/llm-ratelimit:0.2.0
+      placeholder: ghcr.io/genesary/llm-ratelimit:0.3.0
     validations:
       required: true
   - type: dropdown

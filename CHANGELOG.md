@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-06
+
+Soft limits: a budget past its limit lowers a request's priority instead of refusing it.
+
 ### Added
 
 - `soft` limits answer `OK` past their limit and set request headers, for a scheduler to lower the request's priority rather than refuse it. See ADR 0006.
@@ -55,6 +59,7 @@ The first release.
 - **Redis down:** a decision fails at once while every connection is down, so that callers without a deadline (agentgateway) apply their failure mode; upstream holds decisions until the caller's deadline.
 - **Errors instead of panics:** where upstream panics, this service returns an error, at startup or on the request, and TLS checks are stricter. The full list is in `docs/parity.md` §7.
 
-[Unreleased]: https://github.com/genesary/llm-ratelimit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/genesary/llm-ratelimit/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/genesary/llm-ratelimit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/genesary/llm-ratelimit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/genesary/llm-ratelimit/releases/tag/v0.1.0

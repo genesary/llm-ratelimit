@@ -21,7 +21,7 @@ To replace envoy ratelimit behind Envoy, Envoy Gateway or agentgateway, you only
 
 ### Why not
 
-- It is young (v0.2.0) and has a single maintainer. The upstream project has years of production use.
+- It is young (v0.3.0) and has a single maintainer. The upstream project has years of production use.
 - `sliding` windows and `overflow: strict` are designed but not built yet, and are refused at load.
 - Where this service differs on purpose (where upstream panics, an error at startup or on the request; a stricter TLS check; …), the difference is listed in [`docs/parity.md`](docs/parity.md) §7.
 
@@ -50,7 +50,7 @@ docker run -d --name ratelimit --network rl -p 8080:8080 -p 8081:8081 \
   -v "$PWD/runtime:/srv/runtime_data/current:ro" \
   -e RUNTIME_SUBDIRECTORY=ratelimit -e RUNTIME_WATCH_ROOT=false -e USE_STATSD=false \
   -e REDIS_SOCKET_TYPE=tcp -e REDIS_URL=redis:6379 \
-  ghcr.io/genesary/llm-ratelimit:0.2.0
+  ghcr.io/genesary/llm-ratelimit:0.3.0
 ```
 
 gRPC (`envoy.service.ratelimit.v3.RateLimitService`) listens on 8081, and HTTP on 8080. A decision counting 1200 tokens:
@@ -113,8 +113,8 @@ The full documentation is in [`docs/`](docs/README.md):
 Images are published as `ghcr.io/genesary/llm-ratelimit:<version>` for linux/amd64 and linux/arm64, with an SBOM and provenance, signed with cosign (keyless):
 
 ```sh
-cosign verify ghcr.io/genesary/llm-ratelimit:0.2.0 \
-  --certificate-identity https://github.com/genesary/llm-ratelimit/.github/workflows/release.yml@refs/tags/v0.2.0 \
+cosign verify ghcr.io/genesary/llm-ratelimit:0.3.0 \
+  --certificate-identity https://github.com/genesary/llm-ratelimit/.github/workflows/release.yml@refs/tags/v0.3.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
