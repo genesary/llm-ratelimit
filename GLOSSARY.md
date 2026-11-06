@@ -62,6 +62,14 @@ _Avoid_: reset time
 How far below empty a token bucket is, within `max_debt`.
 _Avoid_: overdraft
 
+**Soft limit**:
+A limit that demotes a request past it rather than denying it.
+_Avoid_: quota warning, overage
+
+**Demotion**:
+A request's lower priority at the scheduler, from a soft limit's headers.
+_Avoid_: throttling, downgrade
+
 **Concurrency window**:
 A limit on requests in flight rather than on hits over time: a check takes a slot and an amendment gives it back.
 _Avoid_: in-flight limit, semaphore

@@ -4,7 +4,7 @@ mappings:
   # take a one-key list limit first, so they are rewritten as the regexes they are equivalent
   # to, after these. The deeper rule is unanchored at its end like upstream's own deeper rules,
   # which are kept as they are: `over_limit_with_local_cache` counts in `over_limit` there.
-  - match: "^ratelimit\\.service\\.rate_limit\\.([^.]*)\\.([^.]*)~([0-9A-Za-z][0-9A-Za-z_-]*)\\.(near_limit|over_limit|total_hits|within_limit|shadow_mode|opened_without_hits|slots_acquired|slots_released|slots_expired|releases_without_slot|total_capped_hits)$"
+  - match: "^ratelimit\\.service\\.rate_limit\\.([^.]*)\\.([^.]*)~([0-9A-Za-z][0-9A-Za-z_-]*)\\.(near_limit|over_limit|total_hits|within_limit|shadow_mode|opened_without_hits|slots_acquired|slots_released|slots_expired|releases_without_slot|total_capped_hits|soft_over_limit)$"
     match_type: regex
     name: "ratelimit_service_rate_limit_$4"
     timer_type: "histogram"
@@ -12,7 +12,7 @@ mappings:
       domain: "$1"
       key1: "$2"
       limit: "$3"
-  - match: "^ratelimit\\.service\\.rate_limit\\.([^.]*)\\.([^.]*)\\.([^.]*)(\\.[^.]*)*~([0-9A-Za-z][0-9A-Za-z_-]*)\\.(near_limit|over_limit|total_hits|within_limit|shadow_mode|opened_without_hits|slots_acquired|slots_released|slots_expired|releases_without_slot|total_capped_hits)"
+  - match: "^ratelimit\\.service\\.rate_limit\\.([^.]*)\\.([^.]*)\\.([^.]*)(\\.[^.]*)*~([0-9A-Za-z][0-9A-Za-z_-]*)\\.(near_limit|over_limit|total_hits|within_limit|shadow_mode|opened_without_hits|slots_acquired|slots_released|slots_expired|releases_without_slot|total_capped_hits|soft_over_limit)"
     match_type: regex
     name: "ratelimit_service_rate_limit_$6"
     timer_type: "histogram"

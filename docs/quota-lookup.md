@@ -71,6 +71,7 @@ The keys come out in alphabetical order; the example is reordered for reading.
 | `open` | For anchored windows only: whether a session is open. |
 | `level` | For token buckets only: the whole tokens in the bucket, negative in debt. `limit` is then the capacity, `used` is `limit − level`, and `resets_in_s` the time until it is full, 0 when it is. |
 | `in_flight` | For concurrency windows only: the slots held, leaving out those past their lease. `used` and `used_pct` count them too. |
+| `soft`, `over` | For [soft limits](configuration.md#soft-limits) only: `true`, and whether the next decision would find it over. |
 | `shadow_mode`, `quota_mode` | The descriptor's flags. The figures are the same either way. |
 
 The special cases:

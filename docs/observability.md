@@ -53,6 +53,7 @@ All of them count **hits**, not requests. A request counts 1 hit unless it sends
 | `over_limit_with_local_cache` | Hits the [local cache](backends.md) refused without asking the backend. |
 | `shadow_mode` | Over-limit hits let through because the descriptor has `shadow_mode: true`. |
 | `total_negative_hits` | Hits given back by refunds (`is_negative_hits`). |
+| `soft_over_limit` | Only for [soft limits](configuration.md#soft-limits): decisions that found it over, whether they demoted or not. A request usually makes two, the check and its amendment. |
 | `total_capped_hits` | Only for `token_bucket` windows: hits past `max_debt`, truncated rather than charged. |
 | `slots_acquired`, `slots_released`, `slots_expired`, `releases_without_slot` | Only for `concurrency` windows. See [below](#concurrency-windows). |
 | `opened_without_hits` | Only for `anchored` windows: sessions that a denied request opened without counting hits in them. See [configuration.md](configuration.md#anchored). |
@@ -312,6 +313,7 @@ Each stat goes through a statsd_exporter mapper, which turns its name into a Pro
 | `ratelimit_service_rate_limit_shadow_mode` | same | `shadow_mode` |
 | `ratelimit_service_rate_limit_opened_without_hits` | same | `opened_without_hits` (list limits) |
 | `ratelimit_service_rate_limit_total_capped_hits` | same | `total_capped_hits` |
+| `ratelimit_service_rate_limit_soft_over_limit` | same | `soft_over_limit` |
 | `ratelimit_service_config_fingerprint` | `domain`, `fingerprint` | 1 for what each domain has loaded, 0 for what it had. See [below](#configs-that-diverge). |
 | `ratelimit_service_config_lasting_lockouts` | | Limits in `quota_mode` with `max_debt: unlimited`; absent if there are none |
 | `ratelimit_service_rate_limit_slots_acquired`, `…_slots_released`, `…_slots_expired`, `…_releases_without_slot` | same | The [`concurrency`](#concurrency-windows) counters |

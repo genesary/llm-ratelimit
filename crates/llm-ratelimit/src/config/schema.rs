@@ -67,6 +67,15 @@ pub(crate) struct YamlListLimit {
     /// Whether `unit` or `unlimited` is set, which the list does not allow.
     pub unit: bool,
     pub unlimited: bool,
+    /// `soft:` (D37), when present.
+    pub soft: Option<YamlSoft>,
+}
+
+/// A list limit's `soft`: the request headers when it is over, and otherwise, as written.
+#[derive(Debug, Default)]
+pub(crate) struct YamlSoft {
+    pub over: Vec<(String, String)>,
+    pub under: Vec<(String, String)>,
 }
 
 /// A list limit's `window`, its values as written.
@@ -137,6 +146,10 @@ enum Place {
     Window,
     /// An item of a list limit's `replaces`.
     Replaces,
+    /// A list limit's `soft`.
+    Soft,
+    /// A `soft`'s `over` or `under`: header names.
+    SoftHeaders,
     Other,
 }
 
@@ -155,6 +168,7 @@ impl Place {
                 "replaces",
                 "unit",
                 "unlimited",
+                "soft",
             ]
             .contains(&key),
             Place::Window => [
@@ -171,6 +185,8 @@ impl Place {
             ]
             .contains(&key),
             Place::Replaces => key == "name",
+            Place::Soft => ["over", "under"].contains(&key),
+            Place::SoftHeaders => true,
         }
     }
 
@@ -180,6 +196,8 @@ impl Place {
             (Place::Root | Place::Descriptor, "descriptors") => Place::Descriptor,
             (Place::Descriptor, "rate_limits") => Place::ListLimit,
             (Place::ListLimit, "window") => Place::Window,
+            (Place::ListLimit, "soft") => Place::Soft,
+            (Place::Soft, _) => Place::SoftHeaders,
             (Place::ListLimit, "replaces") => Place::Replaces,
             _ => Place::Other,
         }
@@ -465,6 +483,27 @@ impl Decoder {
         }
     }
 
+    fn soft(&mut self, node: &Node) -> YamlSoft {
+        let mut soft = YamlSoft::default();
+        for (name, v) in self.fields(node, "config.YamlSoft").unwrap_or_default() {
+            let headers = self.soft_headers(v);
+            match name.as_str() {
+                "over" => soft.over = headers,
+                "under" => soft.under = headers,
+                _ => {}
+            }
+        }
+        soft
+    }
+
+    fn soft_headers(&mut self, node: &Node) -> Vec<(String, String)> {
+        self.fields(node, "config.YamlSoftHeaders")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, value)| (name, self.string(value)))
+            .collect()
+    }
+
     fn list_limit(&mut self, node: &Node) -> YamlListLimit {
         let mut limit = YamlListLimit::default();
         for (name, v) in self
@@ -478,6 +517,7 @@ impl Decoder {
                 "replaces" => limit.replaces = self.replaces(v),
                 "unit" => limit.unit = true,
                 "unlimited" => limit.unlimited = true,
+                "soft" => limit.soft = Some(self.soft(v)),
                 _ => {}
             }
         }

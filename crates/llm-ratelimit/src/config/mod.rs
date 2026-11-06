@@ -11,6 +11,7 @@ use llm_ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response;
 use rate_limit_response::rate_limit::Unit;
 use schema::YamlDescriptor;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use window::{
     AnchoredWindow, ConcurrencyWindow, FixedWindow, MaxDebt, OpenOn, Origin, TokenBucketWindow,
     Window,
@@ -73,6 +74,15 @@ pub struct RateLimit {
     pub metadata: Option<prost_types::Struct>,
     /// A `rate_limits:` entry's window; `None` for `rate_limit:`, whose window is its unit.
     pub window: Option<Window>,
+    /// `soft:` (D37): over its limit it demotes rather than denies.
+    pub soft: Option<Arc<Soft>>,
+}
+
+/// The request headers a soft limit adds (D37), the same names in both, in lowercase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Soft {
+    pub over: Vec<(String, String)>,
+    pub under: Vec<(String, String)>,
 }
 
 impl RateLimit {
@@ -94,6 +104,7 @@ impl RateLimit {
             share_threshold_key_pattern: None,
             metadata: None,
             window: None,
+            soft: None,
         }
     }
 }
@@ -613,6 +624,29 @@ fn load_list(
             let quota_mode = config.quota_mode || options.global_quota_mode;
             warn_of_token_bucket(file, &at, bucket, entry.requests_per_unit, quota_mode);
         }
+        let soft = entry
+            .soft
+            .as_ref()
+            .map(|soft| {
+                if options.memcached {
+                    return Err("a soft limit cannot be on Memcached".to_string());
+                }
+                if matches!(window, Window::Concurrency(_)) {
+                    return Err("a concurrency limit cannot be soft".to_string());
+                }
+                if list.len() > 1 {
+                    return Err(
+                        "a soft limit must be alone in its rate_limits: it could hide another's denial"
+                            .to_string(),
+                    );
+                }
+                if config.quota_mode {
+                    return Err("a soft limit cannot be in quota_mode".to_string());
+                }
+                load_soft(soft).map(Arc::new)
+            })
+            .transpose()
+            .map_err(|message| error(&message))?;
         crate::debug!("Creating stats for key: '{at}'");
         let (unit, multiplier) = window.unit();
         let mut limit = RateLimit {
@@ -622,6 +656,7 @@ fn load_list(
             replaces: entry.replaces.clone(),
             metadata: config.metadata.clone(),
             window: Some(window),
+            soft,
             ..RateLimit::new(
                 full_key.to_string(),
                 entry.requests_per_unit,
@@ -666,8 +701,12 @@ fn fingerprint_line(limit: &RateLimit) -> String {
     );
     let mut replaces = limit.replaces.clone();
     replaces.sort();
+    let soft = limit
+        .soft
+        .as_ref()
+        .map_or(String::new(), |soft| format!(" soft={soft:?}"));
     format!(
-        "{}~{} {window} requests_per_unit={requests} unlimited={} shadow_mode={} quota_mode={} detailed_metric={} replaces={replaces:?}\n",
+        "{}~{} {window} requests_per_unit={requests} unlimited={} shadow_mode={} quota_mode={} detailed_metric={} replaces={replaces:?}{soft}\n",
         limit.full_key,
         limit.name,
         limit.unlimited,
@@ -675,6 +714,63 @@ fn fingerprint_line(limit: &RateLimit) -> String {
         limit.quota_mode,
         limit.detailed_metric
     )
+}
+
+/// A `soft`'s headers as the limit keeps them (D37), or why they are refused.
+fn load_soft(soft: &schema::YamlSoft) -> Result<Soft, String> {
+    let headers = |part: &str, written: &[(String, String)]| {
+        let mut headers: Vec<(String, String)> = Vec::new();
+        for (name, value) in written {
+            if !valid_header_name(name) {
+                return Err(format!("invalid header name '{name}' in soft.{part}"));
+            }
+            let printable = value.bytes().all(|b| (0x20..0x7f).contains(&b));
+            if value.is_empty() || value.trim() != value || !printable {
+                return Err(format!("invalid value of header '{name}' in soft.{part}"));
+            }
+            let name = name.to_ascii_lowercase();
+            if headers.iter().any(|(seen, _)| *seen == name) {
+                return Err(format!("duplicate header '{name}' in soft.{part}"));
+            }
+            headers.push((name, value.clone()));
+        }
+        headers.sort();
+        if headers.is_empty() {
+            return Err(format!("soft.{part} needs at least one header"));
+        }
+        Ok(headers)
+    };
+    let (over, under) = (headers("over", &soft.over)?, headers("under", &soft.under)?);
+    if !over.iter().map(|h| &h.0).eq(under.iter().map(|h| &h.0)) {
+        return Err(
+            "soft.over and soft.under must set the same headers, or the client's would survive"
+                .into(),
+        );
+    }
+    Ok(Soft { over, under })
+}
+
+/// Whether `name` is an HTTP token that can be set on a request: not a pseudo-header, nor one
+/// that frames or routes it.
+fn valid_header_name(name: &str) -> bool {
+    const REFUSED: [&str; 11] = [
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        && !REFUSED.contains(&name.to_ascii_lowercase().as_str())
 }
 
 impl Descriptor {
@@ -856,8 +952,9 @@ impl RateLimitConfig {
             // A list limit: its stats key and its window.
             for limit in &descriptor.list {
                 let window = limit.window.as_ref().expect("a list limit's window");
+                let soft = if limit.soft.is_some() { ", soft" } else { "" };
                 out.push_str(&format!(
-                    "{}~{}: window={} requests_per_unit={}, shadow_mode: {}, quota_mode: {}\n",
+                    "{}~{}: window={} requests_per_unit={}, shadow_mode: {}, quota_mode: {}{soft}\n",
                     limit.full_key,
                     limit.name,
                     window.describe(),

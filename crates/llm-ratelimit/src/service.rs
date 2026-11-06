@@ -118,6 +118,8 @@ pub struct LimitReading {
     pub used: u64,
     /// The seconds until that window ends; `None` for an anchored window not open.
     pub reset: Option<i64>,
+    /// Whether the next decision would find it over its limit.
+    pub over: bool,
 }
 
 impl<T: RateLimitCache> RateLimitCache for Arc<T> {
@@ -440,6 +442,7 @@ impl<C: RateLimitCache> RateLimitService<C> {
             ))
             .into());
         }
+        let soft_headers = self.settle_soft(&limits, &mut per_limit);
         self.settle_slots(request, &plans, &limits, &outcomes, &mut per_limit)
             .await?;
         // Each descriptor's representative status (D17), then its shadow mode.
@@ -529,6 +532,7 @@ impl<C: RateLimitCache> RateLimitService<C> {
         if let (Some(names), Some(closest)) = (&self.settings.request_headers, &closest) {
             request_headers_to_add = self.limit_headers(names, closest)?;
         }
+        request_headers_to_add.extend(soft_headers);
         if overall_code == Code::OverLimit && self.settings.global_shadow_mode {
             overall_code = Code::Ok;
             self.stats.global_shadow_mode().inc();
@@ -569,7 +573,51 @@ impl<C: RateLimitCache> RateLimitService<C> {
     /// Whether `limit`'s descriptor is in quota mode. A concurrency limit never is (D35).
     fn quota_mode(&self, limit: Option<&RateLimit>) -> bool {
         let concurrency = limit.is_some_and(|l| matches!(l.window, Some(Window::Concurrency(_))));
-        !concurrency && (self.settings.global_quota_mode || limit.is_some_and(|l| l.quota_mode))
+        let soft = limit.is_some_and(|l| l.soft.is_some());
+        !concurrency
+            && !soft
+            && (self.settings.global_quota_mode || limit.is_some_and(|l| l.quota_mode))
+    }
+
+    /// Turns soft limits' statuses over their limit into `OK`, with none remaining, as shadow
+    /// mode does, and returns their request headers (D37): for one header, `over` beats
+    /// `under`, then the first in the request's order. Shadow mode only observes: it sends
+    /// `under`.
+    fn settle_soft(
+        &self,
+        limits: &[Vec<RateLimit>],
+        per_limit: &mut [Vec<DescriptorStatus>],
+    ) -> Vec<HeaderValue> {
+        let mut chosen: Vec<(&str, &str, bool)> = Vec::new();
+        for (limits, statuses) in limits.iter().zip(per_limit.iter_mut()) {
+            for (limit, status) in limits.iter().zip(statuses.iter_mut()) {
+                let Some(soft) = &limit.soft else {
+                    continue;
+                };
+                let over = status.code() == Code::OverLimit;
+                if over {
+                    self.stats
+                        .rate_limit_counter(&limit.full_key, "soft_over_limit")
+                        .inc();
+                    status.code = Code::Ok as i32;
+                }
+                let demoted = over && !limit.shadow_mode && !self.settings.global_shadow_mode;
+                let headers = if demoted { &soft.over } else { &soft.under };
+                for (name, value) in headers {
+                    match chosen.iter_mut().find(|(seen, _, _)| seen == name) {
+                        None => chosen.push((name, value, demoted)),
+                        Some(first) if demoted && !first.2 => {
+                            *first = (name, value, demoted);
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        chosen
+            .into_iter()
+            .map(|(name, value, _)| header(name, value))
+            .collect()
     }
 
     /// Whether a regular descriptor is over its limit, and which quota groups are. Quota

@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+
+- `soft` limits answer `OK` past their limit and set request headers, for a scheduler to lower the request's priority rather than refuse it. See ADR 0006.
+
 ## [0.2.0] - 2026-11-05
 
 The project is now `llm-ratelimit`, at `ghcr.io/genesary/llm-ratelimit`. To replace envoy ratelimit, you still only change the image.

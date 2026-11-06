@@ -16,7 +16,7 @@ A `type: tokens` descriptor with a `cost` gives us two signals: a check with 0 h
 - **The amendment is not always sent.** It is sent for an HTTP response, 5xx included, and for a stream dropped after it started (`AmendOnDrop`). It is not sent on a transport error (`httpproxy.rs:3330`), a timeout or client disconnect before the response headers (`:1653`), a failed read of a non-streamed body (`llm/mod.rs:2764`) or a response prompt guard's early return. Each retry attempt checks again.
 - With `failOpen`, an amendment still follows a check that failed (`remoteratelimit.rs:373`).
 
-So slots will be orphaned, and the protocol carries nothing that could renew a slot. With llm-d's flow control, a request cancelled while queued before the response headers orphans its slot. A flow control TTL eviction answers 503, so its amendment is sent.
+So slots will be orphaned, and the protocol carries nothing that could renew a slot. With llm-d's flow control, a request cancelled while queued before the response headers orphans its slot. A flow control TTL eviction answers 429 or 503, so its amendment is sent.
 
 ## Decision
 
