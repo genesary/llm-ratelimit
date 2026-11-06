@@ -196,6 +196,7 @@ fn the_default_mapper_labels_list_limits() {
         "slots_expired",
         "releases_without_slot",
         "total_capped_hits",
+        "soft_over_limit",
     ] {
         let cases = [
             (

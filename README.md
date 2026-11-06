@@ -97,6 +97,7 @@ The extensions are listed in [`docs/parity.md`](docs/parity.md) §8:
 - `anchored` windows, opened by a request and lasting their duration;
 - `token_bucket` windows, refilling continuously;
 - `concurrency` windows, limiting the requests in flight;
+- `soft` limits, which lower a request's priority instead of refusing it;
 - the quota lookup, `POST /quota` ([ADR 0003](docs/adr/0003-quota-lookup.md)).
 
 ## Documentation

@@ -934,6 +934,135 @@ domain: d
     assert!(load(legacy).unwrap().fingerprints().is_empty());
 }
 
+/// A `soft` limit takes literal headers, the same names in both, and is refused where it makes
+/// no sense (D37).
+#[test]
+fn soft_limits_load_as_d37_says() {
+    let with_soft = |window: &str, soft: &str| {
+        format!(
+            "domain: d\ndescriptors:\n  - key: user\n    rate_limits:\n      - name: w\n        requests_per_unit: 1\n        window: {window}\n        soft: {soft}\n"
+        )
+    };
+    let fine = "{over: {X-Objective: low}, under: {x-objective: standard}}";
+    for window in [
+        "{type: fixed, duration: 1h}",
+        "{type: anchored, duration: 1h}",
+        "{type: token_bucket, duration: 1h, max_debt: 1h}",
+    ] {
+        let limits = list(&with_soft(window, fine), &[("user", "alice")]);
+        let soft = limits[0].soft.as_ref().unwrap();
+        assert_eq!(soft.over, [("x-objective".to_string(), "low".to_string())]);
+        assert_eq!(
+            soft.under,
+            [("x-objective".to_string(), "standard".to_string())]
+        );
+    }
+    let window = "{type: fixed, duration: 1h}";
+    let error = |message: &str| Some(format!("config.yaml: d.user~w: {message}"));
+    for (soft, message) in [
+        ("{under: {x: a}}", "soft.over needs at least one header"),
+        ("{over: {x: a}}", "soft.under needs at least one header"),
+        (
+            "{over: {x-one: a}, under: {x-two: a}}",
+            "soft.over and soft.under must set the same headers, or the client's would survive",
+        ),
+        (
+            "{over: {x: a, X: b}, under: {x: a}}",
+            "duplicate header 'x' in soft.over",
+        ),
+        (
+            "{over: {':path': a}, under: {':path': a}}",
+            "invalid header name ':path' in soft.over",
+        ),
+        (
+            "{over: {'a b': a}, under: {'a b': a}}",
+            "invalid header name 'a b' in soft.over",
+        ),
+        (
+            "{over: {host: a}, under: {host: a}}",
+            "invalid header name 'host' in soft.over",
+        ),
+        (
+            "{over: {x: ''}, under: {x: a}}",
+            "invalid value of header 'x' in soft.over",
+        ),
+        (
+            "{over: {upgrade: a}, under: {upgrade: a}}",
+            "invalid header name 'upgrade' in soft.over",
+        ),
+        (
+            "{over: {x: ' a'}, under: {x: a}}",
+            "invalid value of header 'x' in soft.over",
+        ),
+        (
+            "{over: {x: \"a\\nb\"}, under: {x: a}}",
+            "invalid value of header 'x' in soft.over",
+        ),
+    ] {
+        assert_eq!(
+            load(&with_soft(window, soft)).err(),
+            error(message),
+            "{soft}"
+        );
+    }
+    assert_eq!(
+        load(&with_soft("{type: concurrency, lease: 1m}", fine)).err(),
+        error("a concurrency limit cannot be soft")
+    );
+    assert_eq!(
+        load(&with_soft(window, "{other: {x: a}}")).err(),
+        Some("config.yaml: config error, unknown key 'other'".to_string())
+    );
+    let beside = "domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: w, requests_per_unit: 1, window: {type: fixed, duration: 1h}, soft: {over: {x: a}, under: {x: b}}}
+      - {name: v, requests_per_unit: 1, window: {type: fixed, duration: 1h}}
+";
+    assert_eq!(
+        load(beside).err(),
+        error("a soft limit must be alone in its rate_limits: it could hide another's denial")
+    );
+    let quota =
+        with_soft(window, fine).replacen("rate_limits:", "quota_mode: true\n    rate_limits:", 1);
+    assert_eq!(
+        load(&quota).err(),
+        error("a soft limit cannot be in quota_mode")
+    );
+    let file = ConfigFile {
+        name: "config.yaml".into(),
+        content: with_soft(window, fine),
+    };
+    let memcached = LoadOptions {
+        memcached: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        config::load(&[file], &memcached)
+            .err()
+            .map(|e| e.to_string()),
+        error("a soft limit cannot be on Memcached")
+    );
+    // Elsewhere, `soft` is an unknown key.
+    assert_eq!(
+        load("domain: d\ndescriptors:\n  - key: user\n    soft: {over: {x: a}, under: {x: b}}\n")
+            .err(),
+        Some("config.yaml: config error, unknown key 'soft'".to_string())
+    );
+    // The fingerprint and `/rlconfig` cover it.
+    let plain = load(&with_window(window)).unwrap();
+    let soft = load(&with_soft(window, fine)).unwrap();
+    assert_ne!(plain.fingerprints(), soft.fingerprints());
+    let other = with_soft(
+        window,
+        "{over: {x-objective: lower}, under: {x-objective: standard}}",
+    );
+    assert_ne!(load(&other).unwrap().fingerprints(), soft.fingerprints());
+    assert!(soft.dump().contains(", soft\n"), "{}", soft.dump());
+    assert!(!plain.dump().contains("soft"));
+}
+
 /// D9's opening and counting, in `envoy` mode: what [`AnchoredWindow::step`] does to a state.
 #[test]
 fn anchored_windows_open_count_and_close_as_d9_says() {

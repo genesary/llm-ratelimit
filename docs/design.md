@@ -6,6 +6,7 @@ Reference document for the design decisions, from the design grilling of 2026-10
 - [ADR 0002 — Origin of fixed windows (`offset`)](adr/0002-origin-of-fixed-windows.md)
 - [ADR 0004 — `concurrency` windows](adr/0004-concurrency-windows.md)
 - [ADR 0005 — Limits adapting to load](adr/0005-limits-adapting-to-load.md) (proposed, not built)
+- [ADR 0006 — Soft limits](adr/0006-soft-limits.md)
 
 Compatibility progress is tracked in [`docs/parity.md`](parity.md).
 
@@ -105,6 +106,8 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 **D12. `duration_until_reset`** *(amended)*. Computed per type and rounded **up** to the second, because agentgateway truncates `x-ratelimit-reset` (`remoteratelimit.rs:606-610`). Never 0 on a denial. Legacy: reproduce `sec − now % sec`, including the possible 0 at the last second of a calendar month. `fixed` with an offset: `D − (now − φ).rem_euclid(D)`.
 
 **D35. `concurrency` windows** ([ADR 0004](adr/0004-concurrency-windows.md)). A limit on requests in flight, on a dedicated `type: tokens`, `cost: "1"` descriptor: a check with 0 hits acquires a slot, an amendment or refund of N releases N. Slots live in a sorted set, purged after `lease`, which is required; a release takes the newest slot. The request's other limits decide first, and slots acquired for a request another `concurrency` limit denies are removed. Redis only, never in the local cache, alone in its list, no `quota_mode`.
+
+**D37. Soft limits** ([ADR 0006](adr/0006-soft-limits.md)). `soft: {over, under}` on a `fixed`, `anchored` or `token_bucket` limit, alone in its list: over its limit it answers `OK` and adds its `over` request headers, otherwise its `under` ones, always one or the other. Literal values, the same names in both. Redis only, never in the local cache, no `quota_mode`. For one header across a request, `over` beats `under`, then the first in the request's order. Shadow mode sends `under`.
 
 **D36. A config's fingerprint.** A hash (xxh64) of a normalised text of each domain with a `rate_limits:` list: its descriptors, limits, windows and thresholds, with descriptors sorted, durations in seconds and defaults spelled out, the metadata left out. What depends on order stays in order: a list's limits and a descriptor's wildcards. In a gauge with a `domain` and a `fingerprint` label, in `/rlconfig`, and in a log line at each load. Domains without a list report nothing, so upstream's configs log and flush what upstream's do. That includes every xDS config, which carries no `rate_limits:` (D28). The environment is not in it (`CACHE_KEY_PREFIX`, `QUOTA_MODE`, `SHADOW_MODE`): it describes the config files. The text starts with a version: changing it makes instances of two releases look as if they diverge, so it changes only with a release note.
 

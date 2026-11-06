@@ -667,6 +667,55 @@ A duration is whole numbers of weeks, days, hours, minutes then seconds, each at
 
 The longest window is 2³² − 1 seconds, about 136 years.
 
+## Soft limits
+
+A limit with `soft` never denies. Past its limit it answers `OK` and sets request headers, for a scheduler to lower the request's priority. Volume then acts as a priority rather than a refusal: nothing is refused while the GPUs have room. See the [agentgateway guide](examples/agentgateway.md#budgets-that-demote-instead-of-deny).
+
+```yaml
+- key: model
+  value: qwen3
+  rate_limits:
+    - name: budget
+      requests_per_unit: 2000000
+      window: {type: token_bucket, duration: 1h, burst: 8000000, max_debt: 1h}
+      soft:
+        over:  {x-llm-d-inference-objective: best-effort-qwen3}   # past its limit
+        under: {x-llm-d-inference-objective: standard}            # otherwise
+```
+
+- **`over` and `under` are both required, with the same header names.** One or the other is always sent. On agentgateway, that overwrites a header of that name from the client; check it on any other client.
+- **Literal values only.** A name is an HTTP token, not a pseudo-header, nor a header that frames or routes the request (`host`, `connection`, `content-length`, `transfer-encoding`, `keep-alive`, `te`, `trailer`, `upgrade`, `proxy-*`). A value is printable ASCII, not empty, with no space around it.
+- **It counts as usual.** Past its limit, a request's hits are counted the same way.
+
+**When it is over:**
+
+| Window | Over | Back under |
+|---|---|---|
+| `token_bucket` | The bucket is empty, before this request's hits: its level is 0 or below. | The next decision once the level is above 0. |
+| `fixed`, `anchored` | The count, this request's hits included, is above the limit. A check at the limit is under. | The next window or session. |
+
+**`max_debt` is how long a demotion can last after a user stops.** With `max_debt: 1h`, up to an hour of refill. **Do not use `max_debt: 0`:** a bucket stopped at empty refills within the second, and its next request is at normal priority, whatever its size, so the budget hardly ever demotes anyone.
+
+**The answer:** the status is `OK`, with `limit_remaining` 0, and `duration_until_reset` as the window says. A client sees it in `x-ratelimit-remaining`. Another limit that denies still makes the answer `OVER_LIMIT`, and `Retry-After` is that limit's.
+
+**Several in a request:** for one header, `over` beats `under`, then the first in the request's order.
+
+**With other settings:**
+
+| Setting | Behaviour |
+|---|---|
+| Other limits in the list | Refused at load: it could hide another's denial. Give a hard limit its own descriptor. |
+| `type: concurrency` | Refused at load. |
+| `BACKEND_TYPE=memcache` | Refused at load. |
+| `quota_mode` | Refused at load. `QUOTA_MODE` leaves it out of quota groups. |
+| `shadow_mode`, `SHADOW_MODE` | Sends `under`; `soft_over_limit` still counts. |
+| `replaces` | As any list limit: a replaced limit adds no header. |
+| `overflow` | `envoy` has no further effect. |
+| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | No effect. |
+| The local cache | Never holds it, so hits are always counted. |
+| `LIMIT_REQUEST_HEADERS_ENABLED` | Its headers come first; a soft header of the same name wins. |
+| A client-sent `limit` | Replaces the limit, `soft` included: it can then deny. Do not send one on this descriptor. |
+
 ## Decisions with several limits
 
 A decision counts the request's hits in every limit of the descriptor's list, then answers one status for that descriptor (Envoy's API has one per descriptor):
@@ -761,6 +810,8 @@ Error loading new configuration: config.messaging.yaml: invalid rate limit unit 
 - `invalid burst 'x'`, `invalid max_debt 'x'`, `burst is for token_bucket windows`, `offset is not for token_bucket windows`, `a token_bucket needs requests_per_unit above 0`, and the same for the other keys
 - `lease is required`, `invalid lease 'x'`, `invalid retry_after 'x'`, `lease is for concurrency windows`, `duration is not for concurrency windows`, and the same for the other keys
 - `a concurrency limit must be alone in its rate_limits: hits release its slots`, `a concurrency limit cannot be in quota_mode`
+- `soft.over needs at least one header`, `soft.over and soft.under must set the same headers, or the client's would survive`, `invalid header name 'x' in soft.over`, `invalid value of header 'x' in soft.over`, `duplicate header 'x' in soft.over`, and the same for `soft.under`
+- `a concurrency limit cannot be soft`, `a soft limit cannot be on Memcached`, `a soft limit must be alone in its rate_limits: it could hide another's denial`, `a soft limit cannot be in quota_mode`
 - `window duration is required`, `invalid window duration '1.5h'`
 - `offset '7d' must be shorter than the window duration '7d'`
 - `offset_rounding '5h' must divide the window duration '7d'`, `offset_rounding needs offset: hashed`

@@ -171,6 +171,152 @@ Choose the bucket if your load comes in surges at session resets, and the countd
 
 Leave the local cache off here too: an amendment on a bucket held there is not counted. `/quota` then shows `level`, negative in debt, `used_pct`, and `resets_in_s`, the time until it is full.
 
+## Budgets that demote instead of deny
+
+A hard quota blocks a user even when the GPUs are free. With the llm-d Router's flow control, volume can act as a priority instead: within budget a request goes at normal priority, and past it, best-effort, served when there is room. A [`soft` limit](../configuration.md#soft-limits) does this, beside a high hard cap against runaway agents and `inflight` as a safeguard.
+
+**It needs two gateways:** this workspace gateway, then an inference gateway holding the InferencePool, as the `baseUrl` below. A gateway calling the pool itself asks the router before its own `tokens` check, so the router would only see the client's header, and nobody is demoted.
+
+The service sends the objective's name itself, for each model. A transformation cannot do it: a `tokens` check runs after every transformation, so it could only read the client's header ([proposal](../upstream/agentgateway-transformation-after-check.md)).
+
+```yaml
+# $RUNTIME_ROOT/ratelimit/config/llm.yaml
+domain: llm
+descriptors:
+  - key: user
+    rate_limits:
+      - name: runaway                       # hard, rarely reached
+        requests_per_unit: 300000000
+        window: {type: fixed, duration: 7d, offset: hashed}
+    descriptors:
+      - key: model                          # one block per accepted model name
+        value: qwen3
+        rate_limits:
+          - name: budget
+            requests_per_unit: 2000000      # refilled per hour: to calibrate
+            window: {type: token_bucket, duration: 1h, burst: 8000000, max_debt: 1h}
+            soft:
+              over:  {x-llm-d-inference-objective: best-effort-qwen3}
+              under: {x-llm-d-inference-objective: standard}
+  - key: inflight_user
+    descriptors:
+      - key: model
+        rate_limits:
+          - name: inflight
+            requests_per_unit: 8
+            window: {type: concurrency, lease: 10m, retry_after: 2s}
+```
+
+**A budget is per user and per model,** so a user on two models has two budgets. **`max_debt` is how long a demotion can last after a user stops:** up to an hour of refill here. `max_debt: 0` almost never demotes: the bucket refills within the second.
+
+Standalone:
+
+```yaml
+llm:
+  port: 4000
+  policies:
+    transformations:
+      request:
+        set:
+          x-llm-d-inference-fairness-id: jwt.sub
+        remove:                             # a client must not choose its target model
+        - x-llm-d-model-name-rewrite
+        - x-gateway-model-name-rewrite
+    remoteRateLimit:
+      domain: llm
+      host: ratelimit:8081
+      descriptors:
+      - entries:
+        - {key: user, value: jwt.sub}
+        - {key: model, value: llm.requestModel}
+        type: tokens
+      - entries:
+        - {key: user, value: jwt.sub}       # the hard cap, over all models
+        type: tokens
+      - entries:
+        - {key: inflight_user, value: jwt.sub}
+        - {key: model, value: llm.requestModel}
+        type: tokens
+        cost: '1'
+  models:                                   # required: other names get 404
+  - name: qwen3
+    provider:
+      custom:
+        formats:
+        - type: completions
+    params:
+      baseUrl: http://inference-gateway/v1
+```
+
+As an `AgentgatewayPolicy`, on the route:
+
+```yaml
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: llm-budgets
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: llm
+  traffic:
+    transformation:
+      request:
+        set:
+          - {name: x-llm-d-inference-fairness-id, value: jwt.sub}
+        remove:
+          - x-llm-d-model-name-rewrite
+          - x-gateway-model-name-rewrite
+    rateLimit:
+      global:
+        backendRef: {name: ratelimit, port: 8081}
+        domain: llm
+        descriptors:
+          - entries:
+              - {name: user, expression: jwt.sub}
+              - {name: model, expression: llm.requestModel}
+            unit: Tokens
+          - entries:
+              - {name: user, expression: jwt.sub}
+            unit: Tokens
+          - entries:
+              - {name: inflight_user, expression: jwt.sub}
+              - {name: model, expression: llm.requestModel}
+            unit: Tokens
+            cost: "1"
+```
+
+One objective per model, in the pool's namespace. `standard` needs none: an unknown name gets priority 0, which is the normal priority.
+
+```yaml
+apiVersion: llm-d.ai/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: best-effort-qwen3
+spec:
+  priority: -10
+  poolRef:
+    name: qwen3-inference-pool
+```
+
+**A transformation attached to the Gateway** runs before the route's policies, without `llm.requestModel` nor a JWT validated on the route: use the route, as above.
+
+**What it does not cover:**
+
+- **`llm.requestModel` is the name the client sent,** and CEL has no resolved model at the check, so an alias is a name of its own. Each accepted name needs a block with its own budget, and `llm.models` is mandatory: without a block a request has no budget, and the client's header goes through. An objective's name is a Kubernetes name, so a model `Qwen/Qwen3` gets `value: Qwen/Qwen3` and `over: {…: best-effort-qwen3}`. **On Kubernetes,** there may be no equivalent of `llm.models`: check that your `ai` backend refuses names you have no block for.
+- **`failureMode: failOpen`.** With the service unreachable, no header is set, so a client's own `x-llm-d-inference-objective` survives. `failClosed` serves nothing then.
+- **What a forged header gains: nothing, while only negative priorities exist.** A forged or unknown name is priority 0, what everyone gets by default; `best-effort-*` only lowers it. An over-budget user cannot forge past the service's value, but with `failOpen` they keep priority 0 during the outage.
+- **The day a positive priority exists,** a forged name would gain it, in the cases above. Add these to the `remove` list on the route, where the service's value still arrives, as its check comes later:
+
+  ```yaml
+        - x-llm-d-inference-objective
+        - x-gateway-inference-objective
+  ```
+
+- **Priority is strict.** Under saturation a best-effort request can wait up to flow control's `defaultRequestTTL`, then gets a 429, or a 503 if the pool has no capacity at all. Its slot is released, as a response comes. Without flow control, a negative priority is rejected at once when saturated.
+- **`/quota`** shows `soft: true` and `over`.
+
 ## Counting like Claude
 
 By default a `tokens` descriptor counts `llm.totalTokens`. Cached input costs a GPU far less than fresh input, and output far more, so a `cost` can weigh them. Here cached input counts for a tenth, fresh input for 1, and output for 4. These weights are examples, to calibrate against your own hardware:
@@ -265,7 +411,7 @@ A refused request answers `429` with `retry-after: 2`, unless a longer limit als
 
 | The request ends with | The slot |
 |---|---|
-| A response, 5xx included | Released. A flow control TTL eviction answers 503, so it is released. |
+| A response, 5xx included | Released. A flow control TTL eviction answers 429 or 503, so it is released. |
 | A stream dropped by the model or the client, after it started | Released. |
 | A client leaving before the response headers, such as a request cancelled while queued by flow control | **Held until its lease.** |
 | A transport error, or `requestTimeout` or `backendRequestTimeout` before the headers | **Held until its lease.** |
@@ -301,6 +447,7 @@ A client shows it as "Session 40 % · resets in 2 h 05 · Week 62 % · resets Mo
 - **Before the first message:** the session has `open: false` and no reset time.
 - **Over 100 %:** `used_pct` can pass 100, because the amendment of the last request is counted even when it overshoots. The next request is then denied until `resets_at`.
 - **Leave the local cache off:** with `LOCAL_CACHE_SIZE_IN_BYTES` set, an amendment on a weekly limit already over can be answered from the cache and not counted, so its `used_pct` stops growing. `anchored` sessions are never cached.
+- **A budget used up slows you down, it does not block you.** A `soft` limit shows `soft: true` and `over: true`: "Budget used: lower priority for 40 min", from `resets_in_s`. Requests still go through, and wait longer when the GPUs are busy.
 - **In flight:** a `concurrency` limit shows `in_flight`, with `limit` and `used_pct`, and no reset: "Requests 2 / 8". To show it, send its descriptor with the user's `model` to `/quota` too.
 - **Polling:** poll about once a minute.
 

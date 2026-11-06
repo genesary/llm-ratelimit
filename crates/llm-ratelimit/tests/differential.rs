@@ -16069,6 +16069,732 @@ const GOLDEN_METRICS: [&str; 18] = [
     "ratelimit_service_total_requests",
 ];
 
+const SOFT: &str = "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: runaway, requests_per_unit: 1000, window: {type: fixed, duration: 7d}}
+    descriptors:
+      - key: model
+        value: m
+        rate_limits:
+          - name: budget
+            requests_per_unit: 60
+            window: {type: token_bucket, duration: 60s, burst: 10, max_debt: 30s}
+            soft:
+              over: {x-objective: best-effort-m}
+              under: {x-objective: standard}
+      - key: model
+        value: stopped
+        rate_limits:
+          - name: budget
+            requests_per_unit: 60
+            window: {type: token_bucket, duration: 60s, burst: 10, max_debt: 0}
+            soft:
+              over: {x-objective: best-effort-stopped}
+              under: {x-objective: standard}
+  - key: fixed
+    rate_limits:
+      - name: l
+        requests_per_unit: 2
+        window: {type: fixed, duration: 1h}
+        soft:
+          over: {x-objective: best-effort-fixed}
+          under: {x-objective: standard}
+  - key: anchored
+    rate_limits:
+      - name: l
+        requests_per_unit: 2
+        window: {type: anchored, duration: 1h}
+        soft:
+          over: {x-objective: best-effort-anchored}
+          under: {x-objective: standard}
+";
+
+/// The budget's descriptor for a model.
+const BUDGET: &[&[(&str, &str)]] = &[&[("user", "alice"), ("model", "m")]];
+
+/// The request headers of a response, as a map.
+fn request_headers(response: &RateLimitResponse) -> BTreeMap<String, String> {
+    response
+        .request_headers_to_add
+        .iter()
+        .map(|header| (header.key.clone(), header.value.clone()))
+        .collect()
+}
+
+/// What a decision on `descriptors` answers: the overall code, the objective, what remains, the
+/// reset.
+async fn soft_answer(
+    h: &Extended,
+    descriptors: &[&[(&str, &str)]],
+    added: u64,
+) -> (Code, String, u32, i64) {
+    let response = h.call(hits(descriptors, added)).await;
+    let status = &response.statuses[0];
+    (
+        response.overall_code(),
+        request_headers(&response)["x-objective"].clone(),
+        status.limit_remaining,
+        status.duration_until_reset.as_ref().unwrap().seconds,
+    )
+}
+
+/// A soft token bucket never denies: within budget it sends `under`; empty, `over`, until it
+/// admits again. `max_debt` is how long that can last: 30 s of refill here (D37).
+#[tokio::test]
+async fn soft_token_buckets_demote_until_they_admit_again() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(SOFT, Settings::default()).await;
+    let answer = |code, objective: &str, left, reset| (code, objective.to_string(), left, reset);
+    h.at(1_000_000_000);
+    assert_eq!(
+        soft_answer(&h, BUDGET, 0).await,
+        answer(Code::Ok, "standard", 10, 0)
+    );
+    // An amendment past what is left is admitted, the bucket still holding tokens before it.
+    assert_eq!(
+        soft_answer(&h, BUDGET, 40).await,
+        answer(Code::Ok, "standard", 0, 40)
+    );
+    // Empty, in debt by 30: demoted, for 31 s, whatever the requests' size.
+    assert_eq!(
+        soft_answer(&h, BUDGET, 0).await,
+        answer(Code::Ok, "best-effort-m", 0, 31)
+    );
+    h.at(1_000_000_030);
+    assert_eq!(
+        soft_answer(&h, BUDGET, 0).await,
+        answer(Code::Ok, "best-effort-m", 0, 1)
+    );
+    h.at(1_000_000_031);
+    assert_eq!(
+        soft_answer(&h, BUDGET, 0).await,
+        answer(Code::Ok, "standard", 1, 9)
+    );
+    let stat = "ratelimit.service.rate_limit.d.user.model_m~budget.soft_over_limit";
+    assert_eq!(h.subject.stats.snapshot()[stat], 2);
+}
+
+/// `max_debt: 0` makes a budget almost useless: stopped at empty, the bucket refills within the
+/// second, and the next request is at normal priority, whatever its size.
+#[tokio::test]
+async fn a_soft_token_bucket_without_debt_demotes_for_a_second() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(SOFT, Settings::default()).await;
+    let budget: &[&[(&str, &str)]] = &[&[("user", "alice"), ("model", "stopped")]];
+    h.at(1_000_000_000);
+    soft_answer(&h, budget, 1000).await;
+    let (_, objective, _, reset) = soft_answer(&h, budget, 0).await;
+    assert_eq!((objective.as_str(), reset), ("best-effort-stopped", 1));
+    h.at(1_000_000_001);
+    let (_, objective, _, _) = soft_answer(&h, budget, 0).await;
+    assert_eq!(objective, "standard");
+}
+
+/// A soft `fixed` or `anchored` limit is over when its count is above the limit, this request's
+/// hits included, and back under with the next window. Counting goes on as usual.
+#[tokio::test]
+async fn soft_fixed_and_anchored_limits_demote_past_their_count() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(SOFT, Settings::default()).await;
+    for (key, over) in [
+        ("fixed", "best-effort-fixed"),
+        ("anchored", "best-effort-anchored"),
+    ] {
+        let descriptor: &[&[(&str, &str)]] = &[&[(key, "a")]];
+        h.at(1_000_000_000);
+        assert_eq!(soft_answer(&h, descriptor, 2).await.1, "standard");
+        // At the limit a check is within it, as for a hard limit.
+        assert_eq!(soft_answer(&h, descriptor, 0).await.1, "standard");
+        let (code, objective, left, _) = soft_answer(&h, descriptor, 1).await;
+        assert_eq!((code, objective.as_str(), left), (Code::Ok, over, 0));
+        assert_eq!(soft_answer(&h, descriptor, 0).await.1, over);
+        h.at(1_000_100_000);
+        assert_eq!(soft_answer(&h, descriptor, 0).await.1, "standard");
+    }
+}
+
+/// Another limit still denies, and a soft status never takes part: its `Retry-After` would be
+/// the budget's. A request with no matching block gets no header (D37).
+#[tokio::test]
+async fn hard_limits_still_deny_beside_a_soft_one() {
+    if !tools_available() {
+        return;
+    }
+    let yaml = SOFT.replace("requests_per_unit: 1000", "requests_per_unit: 5");
+    let h = Extended::start(&yaml, Settings::default()).await;
+    h.at(1_000_000_000);
+    let both: &[&[(&str, &str)]] = &[&[("user", "alice"), ("model", "m")], &[("user", "alice")]];
+    h.call(hits(both, 40)).await;
+    let response = h.call(hits(both, 0)).await;
+    assert_eq!(response.overall_code(), Code::OverLimit);
+    assert_eq!(response.statuses[0].code(), Code::Ok);
+    assert_eq!(response.statuses[0].limit_remaining, 0);
+    assert_eq!(response.statuses[1].code(), Code::OverLimit);
+    let unknown: &[&[(&str, &str)]] = &[&[("user", "alice"), ("model", "unlisted")]];
+    let response = h.call(hits(unknown, 0)).await;
+    assert!(request_headers(&response).is_empty());
+}
+
+/// For one header across a request, `over` beats `under`, then the first in the request's order
+/// (D37). A limit's replaced one adds nothing, and the existing request headers come first.
+#[tokio::test]
+async fn several_soft_limits_decide_a_header_deterministically() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        service: ServiceSettings {
+            request_headers: Some(LimitHeaders::default()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(SOFT, settings).await;
+    h.at(1_000_000_000);
+    let fixed: &[&[(&str, &str)]] = &[&[("fixed", "a")]];
+    let anchored: &[&[(&str, &str)]] = &[&[("anchored", "a")]];
+    h.call(hits(fixed, 3)).await;
+    let under_first: &[&[(&str, &str)]] = &[&[("anchored", "b")], &[("fixed", "a")]];
+    let response = h.call(hits(under_first, 0)).await;
+    assert_eq!(
+        request_headers(&response)["x-objective"],
+        "best-effort-fixed"
+    );
+    h.call(hits(anchored, 3)).await;
+    let both_over: &[&[(&str, &str)]] = &[&[("anchored", "a")], &[("fixed", "a")]];
+    let response = h.call(hits(both_over, 0)).await;
+    assert_eq!(
+        request_headers(&response)["x-objective"],
+        "best-effort-anchored"
+    );
+    assert!(request_headers(&response).contains_key("RateLimit-Limit"));
+    assert_eq!(
+        response
+            .request_headers_to_add
+            .last()
+            .map(|header| header.key.as_str()),
+        Some("x-objective")
+    );
+}
+
+/// A soft limit over its budget takes no part in denying: a concurrency limit beside it takes
+/// its slot, as for a request nothing denies (ADR 0004). A refund answers `under`, its status
+/// `OK`. Per-unit headers and `RateLimit-Remaining` say what remains.
+#[tokio::test]
+async fn soft_limits_beside_slots_and_refunds() {
+    if !tools_available() {
+        return;
+    }
+    let yaml = format!(
+        "{SOFT}  - key: slots\n    rate_limits:\n      - {{name: s, requests_per_unit: 5, window: {{type: concurrency, lease: 10m}}}}\n"
+    );
+    let settings = Settings {
+        service: ServiceSettings {
+            response_headers: Some(LimitHeaders::default()),
+            per_unit_headers: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(&yaml, settings).await;
+    h.at(1_000_000_000);
+    let fixed: &[&[(&str, &str)]] = &[&[("fixed", "a")]];
+    h.call(hits(fixed, 3)).await;
+    let both: &[&[(&str, &str)]] = &[&[("fixed", "a")], &[("slots", "a")]];
+    let response = h.call(hits(both, 0)).await;
+    assert_eq!(response.overall_code(), Code::Ok);
+    assert_eq!(
+        request_headers(&response)["x-objective"],
+        "best-effort-fixed"
+    );
+    assert_eq!(slots_held(&h.redis, "{d_slots_a_}_cc_s").await, "1");
+    let response_headers: BTreeMap<String, String> = response
+        .response_headers_to_add
+        .iter()
+        .map(|header| (header.key.clone(), header.value.clone()))
+        .collect();
+    assert_eq!(response_headers["RateLimit-Remaining"], "0");
+    assert_eq!(response_headers["RateLimit-Limit-Hours"], "2");
+    assert_eq!(response_headers["RateLimit-Remaining-Hours"], "0");
+    let mut refund = hits(fixed, 2);
+    refund.descriptors[0].is_negative_hits = true;
+    let response = h.call(refund).await;
+    assert_eq!(response.statuses[0].code(), Code::Ok);
+    assert_eq!(request_headers(&response)["x-objective"], "standard");
+    assert_eq!(soft_answer(&h, fixed, 0).await.1, "standard");
+}
+
+/// Shadow mode only observes: the limit's over is counted, and `under` is sent. `QUOTA_MODE`
+/// leaves it out of groups, and the local cache never holds it, so amendments keep counting
+/// (D37).
+#[tokio::test]
+async fn soft_limits_with_other_settings() {
+    if !tools_available() {
+        return;
+    }
+    let shadow = SOFT.replace(
+        "  - key: fixed\n",
+        "  - key: fixed\n    shadow_mode: true\n",
+    );
+    let h = Extended::start(&shadow, Settings::default()).await;
+    h.at(1_000_000_000);
+    let fixed: &[&[(&str, &str)]] = &[&[("fixed", "a")]];
+    h.call(hits(fixed, 3)).await;
+    assert_eq!(soft_answer(&h, fixed, 0).await.1, "standard");
+    let stat = "ratelimit.service.rate_limit.d.fixed~l.soft_over_limit";
+    assert_eq!(h.subject.stats.snapshot()[stat], 2);
+
+    let settings = Settings {
+        service: ServiceSettings {
+            global_shadow_mode: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(SOFT, settings).await;
+    h.at(1_000_000_000);
+    h.call(hits(fixed, 3)).await;
+    assert_eq!(soft_answer(&h, fixed, 0).await.1, "standard");
+
+    let settings = Settings {
+        cache: CacheSettings {
+            local_cache_size_in_bytes: 1 << 20,
+            ..Default::default()
+        },
+        service: ServiceSettings {
+            global_quota_mode: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(SOFT, settings).await;
+    h.at(1_000_000_000);
+    h.call(hits(fixed, 3)).await;
+    h.call(hits(fixed, 0)).await;
+    // Over, in Redis every time: the amendment is counted, and a group has no say.
+    let (code, objective, _, _) = soft_answer(&h, fixed, 5).await;
+    assert_eq!((code, objective.as_str()), (Code::Ok, "best-effort-fixed"));
+    let key = "{d_fixed_a_}_fx3600_999997200_l";
+    assert_eq!(h.keys().await[key].0, "8");
+    let snapshot = h.subject.stats.snapshot();
+    assert!(
+        !snapshot
+            .contains_key("ratelimit.service.rate_limit.d.fixed~l.over_limit_with_local_cache")
+    );
+    let bucket: &[&[(&str, &str)]] = &[&[("user", "alice"), ("model", "m")]];
+    h.call(hits(bucket, 20)).await;
+    h.call(hits(bucket, 0)).await;
+    let before = h.keys().await["{d_user_alice_model_m_}_tb60_budget"]
+        .0
+        .clone();
+    h.call(hits(bucket, 1)).await;
+    assert_ne!(
+        h.keys().await["{d_user_alice_model_m_}_tb60_budget"].0,
+        before
+    );
+}
+
+/// A replaced soft limit adds no header.
+#[tokio::test]
+async fn a_replaced_soft_limit_adds_no_header() {
+    if !tools_available() {
+        return;
+    }
+    let yaml = "
+domain: d
+descriptors:
+  - key: fixed
+    rate_limits:
+      - name: l
+        requests_per_unit: 2
+        window: {type: fixed, duration: 1h}
+        soft: {over: {x-objective: low}, under: {x-objective: standard}}
+  - key: vip
+    rate_limits:
+      - {name: v, requests_per_unit: 2, window: {type: fixed, duration: 1h}, replaces: [{name: l}]}
+";
+    let h = Extended::start(yaml, Settings::default()).await;
+    h.at(1_000_000_000);
+    let response = h.call(hits(&[&[("fixed", "a")], &[("vip", "a")]], 0)).await;
+    assert!(request_headers(&response).is_empty());
+}
+
+/// The quota lookup says a limit is soft, and whether it is over.
+#[tokio::test]
+async fn quota_lookups_show_soft_limits() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(SOFT, Settings::default()).await;
+    h.at(1_000_000_000);
+    let shown = async |descriptor: &[&[(&str, &str)]]| {
+        let lookup = h
+            .subject
+            .service
+            .lookup(&request("d", descriptor))
+            .await
+            .unwrap();
+        let rendered: serde_json::Value =
+            serde_json::from_str(&llm_ratelimit::quota::render(&lookup)).unwrap();
+        rendered["descriptors"][0]["limits"][0].clone()
+    };
+    let budget = shown(BUDGET).await;
+    assert_eq!(
+        (&budget["soft"], &budget["over"]),
+        (&serde_json::json!(true), &serde_json::json!(false))
+    );
+    h.call(hits(BUDGET, 40)).await;
+    assert_eq!(shown(BUDGET).await["over"], true);
+    let fixed: &[&[(&str, &str)]] = &[&[("fixed", "a")]];
+    h.call(hits(fixed, 2)).await;
+    assert_eq!(shown(fixed).await["over"], false);
+    h.call(hits(fixed, 1)).await;
+    assert_eq!(shown(fixed).await["over"], true);
+    // Half a token left: under, as the next decision says, though no whole token remains.
+    let half = "domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - name: b
+        requests_per_unit: 30
+        window: {type: token_bucket, duration: 60s, burst: 1, max_debt: 0}
+        soft: {over: {x-objective: low}, under: {x-objective: standard}}
+";
+    let h = Extended::start(half, Settings::default()).await;
+    h.at(1_000_000_000);
+    let user: &[&[(&str, &str)]] = &[&[("user", "a")]];
+    h.call(hits(user, 5)).await;
+    h.at(1_000_000_001);
+    let lookup = h.subject.service.lookup(&request("d", user)).await.unwrap();
+    let rendered: serde_json::Value =
+        serde_json::from_str(&llm_ratelimit::quota::render(&lookup)).unwrap();
+    assert_eq!(rendered["descriptors"][0]["limits"][0]["over"], false);
+    assert_eq!(soft_answer(&h, user, 0).await.1, "standard");
+    // A hard limit says nothing of it.
+    let hard = shown(&[&[("user", "alice")]]).await;
+    assert!(hard.get("soft").is_none() && hard.get("over").is_none());
+}
+
+/// Instances share a budget: what one counted demotes through another.
+#[tokio::test]
+async fn several_instances_share_a_soft_budget() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("soft-instances");
+    let yaml = "domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - name: budget
+        requests_per_unit: 1
+        window: {type: token_bucket, duration: 1h, burst: 5, max_debt: 1h}
+        soft: {over: {x-objective: low}, under: {x-objective: standard}}
+";
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/d.yaml", yaml.as_bytes()),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_llm-ratelimit"));
+    let environment = binary_environment(&runtime, &redis);
+    let one = Service::start(&binary, &environment).await;
+    let two = Service::start(&binary, &environment).await;
+    let (mut first, mut second) = (one.client().await, two.client().await);
+    let alice: &[&[(&str, &str)]] = &[&[("user", "alice")]];
+    let objective = |response: RateLimitResponse| request_headers(&response)["x-objective"].clone();
+    let answer = second.should_rate_limit(hits(alice, 0)).await.unwrap();
+    assert_eq!(objective(answer.into_inner()), "standard");
+    first.should_rate_limit(hits(alice, 6)).await.unwrap();
+    let answer = second.should_rate_limit(hits(alice, 0)).await.unwrap();
+    assert_eq!(objective(answer.into_inner()), "low");
+}
+
+/// A stand-in for vLLM that records the headers it receives, and always reports 100 tokens used.
+async fn llm_recording_stand_in() -> (u16, Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let recorded = recorded.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let Ok(n) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(at) = text.find("\r\n\r\n") {
+                        let headers: BTreeMap<String, String> = text[..at]
+                            .lines()
+                            .skip(1)
+                            .filter_map(|line| line.split_once(": "))
+                            .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
+                            .collect();
+                        let length = headers
+                            .get("content-length")
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= at + 4 + length {
+                            recorded.lock().unwrap().push(headers);
+                            break;
+                        }
+                    }
+                }
+                let json = r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":50,"total_tokens":100}}"#;
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+                let _ = stream.write_all(answer.as_bytes()).await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// Starts agentgateway with these `remoteRateLimit` `failureMode` and `llm` policies; its port.
+async fn soft_gateway(
+    agentgateway: &str,
+    runtime: &std::path::Path,
+    rls: &str,
+    llm: u16,
+    failure_mode: &str,
+    extra_policies: &str,
+) -> (Child, String) {
+    let (llm_port, admin, stats, ready) = (
+        reserved_port(),
+        reserved_port(),
+        reserved_port(),
+        reserved_port(),
+    );
+    let model = |name: &str| {
+        format!(
+            "  - name: {name}
+    provider:
+      custom:
+        formats:
+        - type: completions
+    params:
+      baseUrl: http://127.0.0.1:{llm}/v1
+      model: {name}
+"
+        )
+    };
+    let config = format!(
+        "config:
+  adminAddr: 127.0.0.1:{admin}
+  statsAddr: 127.0.0.1:{stats}
+  readinessAddr: 127.0.0.1:{ready}
+llm:
+  port: {llm_port}
+  policies:
+{extra_policies}    remoteRateLimit:
+      domain: llm
+      host: {rls}
+      failureMode: {failure_mode}
+      descriptors:
+      - entries:
+        - key: user
+          value: '\"alice\"'
+        - key: model
+          value: llm.requestModel
+        type: tokens
+      - entries:
+        - key: user
+          value: '\"alice\"'
+        type: tokens
+  models:
+{}{}",
+        model("qwen3"),
+        model("noblock"),
+    );
+    let path = runtime.join(format!("agentgateway-{llm_port}.yaml"));
+    std::fs::write(&path, config).unwrap();
+    let mut gateway = Command::new(agentgateway)
+        .arg("-f")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start agentgateway");
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", llm_port))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(gateway.try_wait().unwrap().is_none(), "agentgateway exited");
+    (gateway, format!("127.0.0.1:{llm_port}"))
+}
+
+/// With a real agentgateway (`RATELIMIT_AGENTGATEWAY=<path>`), what reaches the model is the
+/// service's header, whatever the client sends, under and over. `failOpen` with the service
+/// unreachable, or a model with no block, lets the client's through, unless the route removes
+/// it; `failClosed` serves nothing. `llm.models` refuses a name it does not know.
+#[tokio::test]
+async fn a_real_agentgateway_sends_the_soft_limits_header_upstream() {
+    let Ok(agentgateway) = std::env::var("RATELIMIT_AGENTGATEWAY") else {
+        return;
+    };
+    if !tools_available() {
+        return;
+    }
+    const OBJECTIVE: &str = "x-llm-d-inference-objective";
+    let runtime = temp_dir("agentgateway-soft");
+    let limits = "domain: llm
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: runaway, requests_per_unit: 100000000, window: {type: fixed, duration: 7d}}
+    descriptors:
+      - key: model
+        value: qwen3
+        rate_limits:
+          - name: budget
+            requests_per_unit: 1
+            window: {type: token_bucket, duration: 1h, burst: 150, max_debt: 1h}
+            soft:
+              over: {x-llm-d-inference-objective: best-effort-qwen3}
+              under: {x-llm-d-inference-objective: standard}
+";
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", limits.as_bytes()),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    let service = Service::start(
+        std::path::Path::new(env!("CARGO_BIN_EXE_llm-ratelimit")),
+        &binary_environment(&runtime, &redis),
+    )
+    .await;
+    service.client().await;
+    let rls = service.grpc.trim_start_matches("http://").to_string();
+    let (llm, seen) = llm_recording_stand_in().await;
+    let chat = |model: &str, forged: bool| {
+        let body =
+            format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}]}}"#);
+        let extra = if forged {
+            "x-llm-d-inference-objective: forged\r\nx-gateway-inference-objective: forged\r\nx-llm-d-model-name-rewrite: forged\r\nx-gateway-model-name-rewrite: forged\r\n"
+        } else {
+            ""
+        };
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: llm\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let status = |answer: &str| answer.split(' ').nth(1).unwrap_or_default().to_string();
+    let last = || seen.lock().unwrap().last().cloned().unwrap_or_default();
+    // No extra policy: over or under, the service's value overwrites the client's.
+    let (_gateway, address) =
+        soft_gateway(&agentgateway, &runtime, &rls, llm, "failClosed", "").await;
+    let answer = send_raw(&address, &chat("qwen3", true)).await;
+    assert_eq!(status(&answer), "200", "{answer}");
+    assert_eq!(last()[OBJECTIVE], "standard");
+    // Only the objective it set is overwritten: the alias and the rewrite are the client's.
+    assert_eq!(last()["x-llm-d-model-name-rewrite"], "forged");
+    // The amendment is sent after the response: wait for it.
+    let key_exists = async || {
+        for _ in 0..100 {
+            let reply = resp_command(
+                &redis.address,
+                &["GET", "{llm_user_alice_model_qwen3_}_tb3600_budget"],
+            )
+            .await;
+            if reply.starts_with('$') && !reply.starts_with("$-1") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the amendment did not come");
+    };
+    key_exists().await;
+    // 100 of 150 used: still under.
+    let answer = send_raw(&address, &chat("qwen3", true)).await;
+    assert_eq!(status(&answer), "200", "{answer}");
+    assert_eq!(last()[OBJECTIVE], "standard");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // 200 of 150: over, served all the same.
+    let answer = send_raw(&address, &chat("qwen3", true)).await;
+    assert_eq!(status(&answer), "200", "{answer}");
+    assert_eq!(last()[OBJECTIVE], "best-effort-qwen3");
+    // A name with no block has no budget: the client's header survives.
+    let answer = send_raw(&address, &chat("noblock", true)).await;
+    assert_eq!(status(&answer), "200", "{answer}");
+    assert_eq!(last()[OBJECTIVE], "forged");
+    // A name `llm.models` does not list is refused.
+    let answer = send_raw(&address, &chat("other", true)).await;
+    assert_eq!(status(&answer), "404", "{answer}");
+
+    // The service unreachable: nothing in `failClosed`; in `failOpen`, the client's survives.
+    let gone = format!("127.0.0.1:{}", reserved_port());
+    let (_closed, address) =
+        soft_gateway(&agentgateway, &runtime, &gone, llm, "failClosed", "").await;
+    let answer = send_raw(&address, &chat("qwen3", true)).await;
+    assert!(status(&answer).starts_with('5'), "{answer}");
+    let (_open, address) = soft_gateway(&agentgateway, &runtime, &gone, llm, "failOpen", "").await;
+    let answer = send_raw(&address, &chat("qwen3", true)).await;
+    assert_eq!(status(&answer), "200", "{answer}");
+    assert_eq!(last()[OBJECTIVE], "forged");
+
+    // Removing them on the route: the rewrites never reach the model, nor a forged objective,
+    // and the service's value still arrives, as its check comes after.
+    let remove = "    transformations:
+      request:
+        remove:
+        - x-llm-d-inference-objective
+        - x-gateway-inference-objective
+        - x-llm-d-model-name-rewrite
+        - x-gateway-model-name-rewrite
+";
+    let (_open, address) =
+        soft_gateway(&agentgateway, &runtime, &gone, llm, "failOpen", remove).await;
+    let answer = send_raw(&address, &chat("qwen3", true)).await;
+    assert_eq!(status(&answer), "200", "{answer}");
+    for header in [
+        OBJECTIVE,
+        "x-gateway-inference-objective",
+        "x-llm-d-model-name-rewrite",
+        "x-gateway-model-name-rewrite",
+    ] {
+        assert!(!last().contains_key(header), "{header}: {:?}", last());
+    }
+    let (_closed, address) =
+        soft_gateway(&agentgateway, &runtime, &rls, llm, "failClosed", remove).await;
+    let answer = send_raw(&address, &chat("qwen3", true)).await;
+    assert_eq!(status(&answer), "200", "{answer}");
+    assert_eq!(last()[OBJECTIVE], "best-effort-qwen3");
+    assert!(!last().contains_key("x-llm-d-model-name-rewrite"));
+}
+
 /// `LIMIT_PER_UNIT_HEADERS_ENABLED` describes every limit of every list, a window of several
 /// units under its own name (D13); `RateLimit-Reset` is the representative's window's,
 /// offset included, re-read from the clock.

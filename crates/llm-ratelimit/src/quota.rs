@@ -65,6 +65,10 @@ fn limit_entry(limit: &RateLimit, reading: &LimitReading, now: i64) -> Value {
     if let Some(Window::TokenBucket(_)) = &limit.window {
         entry["level"] = json!(requests as i64 - reading.used as i64);
     }
+    if limit.soft.is_some() {
+        entry["soft"] = json!(true);
+        entry["over"] = json!(reading.over);
+    }
     entry
 }
 

@@ -376,6 +376,7 @@ impl RateLimitCache for RedisCache {
             let over_in_local_cache = !hits.refund
                 && !anchored
                 && !concurrency
+                && limit.soft.is_none()
                 && self
                     .local_cache
                     .as_ref()
@@ -550,6 +551,7 @@ impl RateLimitCache for RedisCache {
             } else if let (false, Count::After(after), Some(cache)) =
                 (c.hits.refund, counts[c.index][c.slot], &self.local_cache)
                 && limiter::exceeds(c.limit, after)
+                && c.limit.soft.is_none()
                 && !matches!(
                     c.limit.window,
                     Some(Window::Anchored(_) | Window::Concurrency(_) | Window::TokenBucket(_))
@@ -782,7 +784,8 @@ impl RedisCache {
         if !admitted {
             let wait = window.until_admitted(result.after, now, requests);
             // freecache's expiry is 32 bits: a wait past it is not worth an entry.
-            let shadow = c.limit.shadow_mode || self.settings.global_shadow_mode;
+            let shadow =
+                c.limit.shadow_mode || self.settings.global_shadow_mode || c.limit.soft.is_some();
             if let (false, true, Some(cache)) = (shadow, wait < 1 << 31, &self.local_cache)
                 && !cache.insert(&c.key, wait, now)
             {
@@ -1012,30 +1015,40 @@ impl RedisCache {
                 Some(Window::Anchored(window)) => {
                     // Closed as a decision closes it, whether or not the key expired yet.
                     let open = window.open(command.stored_anchored(reply)?, now);
+                    let used = open.map_or(0, |w| w.count);
                     LimitReading {
-                        used: open.map_or(0, |w| w.count),
+                        used,
                         reset: open.map(|w| window.reset(Some(w), now)),
+                        over: limiter::exceeds(limit, used),
                     }
                 }
                 Some(Window::TokenBucket(window)) => {
                     // No key is a full bucket.
                     let stored = command.counter(reply)? as f64;
+                    let requests = limit.limit.requests_per_unit;
                     LimitReading {
-                        used: window.used(stored, now, limit.limit.requests_per_unit),
+                        used: window.used(stored, now, requests),
                         reset: Some(window.until_full(stored, now)),
+                        over: !window.admits(stored, now, requests),
                     }
                 }
                 // Slots have no window to reset.
-                Some(Window::Concurrency(_)) => LimitReading {
-                    used: command.counter(reply)?,
-                    reset: None,
-                },
+                Some(Window::Concurrency(_)) => {
+                    let used = command.counter(reply)?;
+                    LimitReading {
+                        used,
+                        reset: None,
+                        over: limiter::exceeds(limit, used),
+                    }
+                }
                 _ => {
                     let calendar = self.settings.use_calendar_month;
                     let descriptor = &request.descriptors[index];
+                    let used = command.counter(reply)?;
                     LimitReading {
-                        used: command.counter(reply)?,
+                        used,
                         reset: Some(limiter::reset(limit, descriptor, now, calendar)?),
+                        over: limiter::exceeds(limit, used),
                     }
                 }
             };

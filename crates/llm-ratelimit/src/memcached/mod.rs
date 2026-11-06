@@ -202,6 +202,8 @@ impl RateLimitCache for MemcacheCache {
             readings[index].push(LimitReading {
                 used,
                 reset: Some(reset),
+                // A soft limit is refused on Memcached: nothing reads it.
+                over: false,
             });
         }
         Ok((now, readings))
